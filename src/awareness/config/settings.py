@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     # ── identity ─────────────────────────────────────────────────────────
     ingest_version: str = "0.1.0"
     user_agent: str = (
-        "AwarenessBot/0.1 (+https://github.com/nazmiefearmutcu/desktop-tutorial; "
+        "AwarenessBot/0.1 (+https://github.com/nazmiefearmutcu/claude; "
         "public-text-research)"
     )
     contact_email: str = "research@example.invalid"

@@ -3,7 +3,7 @@
 # the Settings field name, case-insensitive). See src/awareness/config/settings.py.
 
 ingest_version: "0.1.0"
-user_agent: "AwarenessBot/0.1 (+https://github.com/nazmiefearmutcu/desktop-tutorial; public-text-research)"
+user_agent: "AwarenessBot/0.1 (+https://github.com/nazmiefearmutcu/claude; public-text-research)"
 contact_email: "research@example.invalid"
 
 # Politeness
