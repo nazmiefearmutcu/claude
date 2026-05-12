@@ -1,378 +1,680 @@
-// Awareness dashboard controller.
-//
-// Strict XSS hygiene: all data values touch the DOM exclusively via
-// textContent / setAttribute / createElement — never innerHTML. The only
-// places we set innerHTML are for static structure cleared between renders.
+// awareness — research workbench
+// Vanilla ES module. Router + 5 views + command palette + reader + live feed
+// + keyboard navigation + a11y. All dynamic DOM via createElement+textContent
+// so server values never reach an HTML parser.
 
-(() => {
-  // ── tiny DOM + format helpers ──────────────────────────────────────
-  const $ = (q) => document.querySelector(q);
-  const $$ = (q) => Array.from(document.querySelectorAll(q));
+const $ = (q, root = document) => root.querySelector(q);
+const $$ = (q, root = document) => Array.from(root.querySelectorAll(q));
 
-  function el(tag, props, ...children) {
-    const node = document.createElement(tag);
-    if (props) {
-      for (const [k, v] of Object.entries(props)) {
-        if (v == null) continue;
-        if (k === "class") node.className = v;
-        else if (k === "text") node.textContent = v;
-        else if (k === "dataset") for (const [dk, dv] of Object.entries(v)) node.dataset[dk] = dv;
-        else if (k === "style") Object.assign(node.style, v);
-        else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
-        else node.setAttribute(k, v);
-      }
+// ── DOM builder ───────────────────────────────────────────────
+function el(tag, props, ...children) {
+  const node = document.createElement(tag);
+  if (props) {
+    for (const [k, v] of Object.entries(props)) {
+      if (v == null || v === false) continue;
+      if (k === "class") node.className = v;
+      else if (k === "text") node.textContent = v;
+      else if (k === "html") {} // intentionally unsupported
+      else if (k === "dataset") for (const [dk, dv] of Object.entries(v)) node.dataset[dk] = dv;
+      else if (k === "style") Object.assign(node.style, v);
+      else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v === true ? "" : String(v));
     }
-    for (const c of children) {
-      if (c == null || c === false) continue;
-      node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-    }
-    return node;
   }
-  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
-
-  const fmt = (n) => (n == null ? "—" : new Intl.NumberFormat().format(n));
-  const ago = (iso) => {
-    if (!iso) return "—";
-    const t = new Date(iso).getTime();
-    if (Number.isNaN(t)) return String(iso);
-    const d = (Date.now() - t) / 1000;
-    if (d < 60) return Math.max(1, Math.round(d)) + "s ago";
-    if (d < 3600) return Math.round(d / 60) + "m ago";
-    if (d < 86400) return Math.round(d / 3600) + "h ago";
-    return Math.round(d / 86400) + "d ago";
-  };
-  const isoDay = (d) => new Date(d).toISOString().slice(0, 10);
-
-  let toastTimer;
-  function toast(msg, kind = "ok") {
-    const t = $("#toast");
-    t.textContent = msg;
-    t.className = "toast show " + kind;
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => (t.className = "toast"), 3200);
+  for (const c of children) {
+    if (c == null || c === false) continue;
+    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
   }
+  return node;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
-  async function api(path, opts = {}) {
-    const res = await fetch(path, {
-      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-      ...opts,
+// ── Helpers ───────────────────────────────────────────────────
+const fmt = (n) => (n == null ? "—" : new Intl.NumberFormat("en-US").format(n));
+const ago = (iso, short = true) => {
+  if (!iso) return "—";
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return String(iso);
+  const d = Math.max(0, (Date.now() - t) / 1000);
+  if (d < 60) return short ? Math.max(1, Math.round(d)) + "s" : Math.max(1, Math.round(d)) + "s ago";
+  if (d < 3600) return short ? Math.round(d / 60) + "m" : Math.round(d / 60) + "m ago";
+  if (d < 86400) return short ? Math.round(d / 3600) + "h" : Math.round(d / 3600) + "h ago";
+  return short ? Math.round(d / 86400) + "d" : Math.round(d / 86400) + "d ago";
+};
+const isoDay = (d) => new Date(d).toISOString().slice(0, 10);
+
+// ── Toast ─────────────────────────────────────────────────────
+let toastTimer;
+function toast(msg, kind = "ok") {
+  const t = $("#toast");
+  if (!t) return;
+  t.textContent = msg;
+  t.className = "toast show " + kind;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.className = "toast"), 3400);
+}
+
+// ── API ───────────────────────────────────────────────────────
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+    ...opts,
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (_) {}
+    throw new Error(res.status + " " + detail);
+  }
+  if (res.status === 204) return null;
+  return await res.json();
+}
+
+// ── KPI animation (count-up) ──────────────────────────────────
+const kpiState = new Map();
+function setKPI(id, target, opts = {}) {
+  const node = $("#" + id);
+  if (!node) return;
+  const prev = kpiState.get(id) ?? 0;
+  if (target === prev) {
+    node.textContent = fmt(target);
+    node.classList.toggle("is-zero", target === 0);
+    return;
+  }
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduce) {
+    node.textContent = fmt(target);
+    kpiState.set(id, target);
+    node.classList.toggle("is-zero", target === 0);
+    return;
+  }
+  const start = performance.now();
+  const dur = 700;
+  function frame(now) {
+    const k = Math.min(1, (now - start) / dur);
+    const eased = 1 - Math.pow(1 - k, 3);
+    const v = Math.round(prev + (target - prev) * eased);
+    node.textContent = fmt(v);
+    if (k < 1) requestAnimationFrame(frame);
+    else { kpiState.set(id, target); node.classList.toggle("is-zero", target === 0); }
+  }
+  requestAnimationFrame(frame);
+}
+
+// ── Router ────────────────────────────────────────────────────
+const ROUTES = ["dashboard", "captures", "jobs", "tail", "settings"];
+let currentRoute = "dashboard";
+function navigate(route, { push = true } = {}) {
+  if (!ROUTES.includes(route)) route = "dashboard";
+  currentRoute = route;
+  $$(".view").forEach((v) => {
+    const match = v.dataset.view === route;
+    v.toggleAttribute("hidden", !match);
+    v.classList.toggle("is-active", match);
+  });
+  $$(".nav-item").forEach((n) => {
+    const match = n.dataset.route === route;
+    if (match) n.setAttribute("aria-current", "page");
+    else n.removeAttribute("aria-current");
+  });
+  // Hide rail except on dashboard.
+  $(".app").classList.toggle("no-rail", route !== "dashboard");
+
+  if (push) history.pushState({ route }, "", "#" + route);
+  // Move keyboard focus to main heading for screen readers.
+  setTimeout(() => $("#main").focus({ preventScroll: false }), 50);
+
+  // Lazy-load views' data on activation.
+  if (route === "captures") void loadCaptures(true);
+  if (route === "jobs") void loadJobs();
+  if (route === "tail") void loadTailView();
+  if (route === "settings") void loadSettings();
+}
+window.addEventListener("popstate", (e) => {
+  const r = (location.hash || "#dashboard").slice(1);
+  navigate(r, { push: false });
+});
+
+// ── Header / Dashboard refresh ────────────────────────────────
+let lastFeedCaptureId = null;
+async function refreshDashboard() {
+  let status, dedup;
+  try {
+    [status, dedup] = await Promise.all([api("/status"), api("/dedup-stats")]);
+  } catch (e) { console.error(e); return; }
+
+  const tail = status.tail || {};
+  const jobsTotal = (status.jobs || []).length;
+  const docsTotal = (status.jobs || []).reduce((a, j) => a + (j.docs_emitted || 0), 0);
+
+  setKPI("kpi-captures", dedup.total_captures_seen || 0);
+  setKPI("kpi-distinct", dedup.distinct_content_hashes || 0);
+  setKPI("kpi-folds", Math.max(0, (dedup.total_captures_seen || 0) - (dedup.distinct_content_hashes || 0)));
+  setKPI("kpi-jobs", jobsTotal);
+
+  $("#kpi-captures-sub").textContent = (docsTotal ? `${fmt(docsTotal)} emitted across jobs` : "across the corpus");
+  $("#kpi-distinct-sub").textContent = "unique content";
+  $("#kpi-folds-sub").textContent = `${fmt(dedup.near_dup_index_rows || 0)} simhash rows`;
+  $("#kpi-jobs-sub").textContent = "backfill & tail runs";
+
+  // Tail strip (dashboard)
+  const strip = $("#tail-strip");
+  const pulse = strip.querySelector(".tail-pulse");
+  pulse.dataset.state = tail.running ? "on" : "off";
+  $("#tail-strip-state").textContent = tail.running ? "running" : "stopped";
+  $("#tail-strip-detail").textContent = tail.running
+    ? `Reading public feeds. Job ${tail.job_id || "—"}.`
+    : (tail.stopped_at ? `Last stopped ${ago(tail.stopped_at, false)}.` : "No live capture running.");
+  $("#tail-strip-meta").textContent = tail.running ? `started ${ago(tail.started_at, false)}` : "";
+
+  // Sidebar tail card
+  $("#sidebar-tail .tail-led").dataset.state = tail.running ? "on" : "off";
+  $("#sidebar-tail-status").textContent = tail.running ? "running" : "stopped";
+  $("#sidebar-tail-meta").textContent = tail.running
+    ? `since ${ago(tail.started_at, true)}`
+    : (tail.stopped_at ? `since ${ago(tail.stopped_at, true)} ago` : "—");
+
+  // Recent jobs strip
+  renderJobStrip($("#jobs-strip"), (status.jobs || []).slice(0, 4));
+
+  return { status, dedup };
+}
+
+function renderJobStrip(root, jobs) {
+  clear(root);
+  if (!jobs.length) {
+    root.appendChild(el("p", { class: "muted", style: { padding: "22px 24px" } }, "No jobs yet."));
+    return;
+  }
+  for (const j of jobs) {
+    const pct = j.tasks_total ? Math.round(100 * j.tasks_completed / j.tasks_total) : 0;
+    const idCell = el("div", { class: "job-id" });
+    idCell.appendChild(document.createTextNode(j.job_id));
+    idCell.appendChild(el("span", { class: "kind", text: j.kind }));
+
+    const progress = el("div", { class: "job-progress", "aria-label": `progress ${pct}%`, role: "progressbar", "aria-valuenow": pct, "aria-valuemin": 0, "aria-valuemax": 100 });
+    progress.appendChild(el("div", { class: "job-progress-bar", style: { width: pct + "%" } }));
+
+    const counters = el("div", { class: "job-counters" });
+    counters.appendChild(document.createTextNode(`${j.tasks_completed}/${j.tasks_total} tasks · `));
+    counters.appendChild(el("b", { text: fmt(j.docs_emitted) }));
+    counters.appendChild(document.createTextNode(" docs · "));
+    counters.appendChild(el("b", { text: fmt(j.docs_dedup_dropped) }));
+    counters.appendChild(document.createTextNode(" folded"));
+
+    const badge = el("span", { class: "badge badge-" + j.status, text: j.status });
+    const row = el("div", { class: "job-row" }, idCell, progress, counters, badge);
+    root.appendChild(row);
+  }
+}
+
+// ── Captures view ─────────────────────────────────────────────
+const caps = { limit: 30, offset: 0, total: 0 };
+let capsSearchTimer = null;
+
+async function loadCaptures(reset = false) {
+  if (reset) caps.offset = 0;
+  const params = new URLSearchParams();
+  params.set("limit", caps.limit);
+  params.set("offset", caps.offset);
+  const q = $("#caps-search").value.trim();
+  const source = $("#caps-source").value;
+  const domain = $("#caps-domain").value.trim();
+  const start = $("#caps-start").value;
+  const end = $("#caps-end").value;
+  if (q) params.set("search", q);
+  if (source) params.set("source", source);
+  if (domain) params.set("domain", domain);
+  if (start) params.set("start", start);
+  if (end) params.set("end", end);
+
+  const list = $("#caps-list");
+  const meta = $("#caps-meta");
+  meta.textContent = "loading…";
+
+  try {
+    const data = await api("/captures?" + params.toString());
+    caps.total = data.total;
+    renderCaps(list, data.rows);
+    const from = data.total ? caps.offset + 1 : 0;
+    const to = Math.min(caps.offset + data.rows.length, data.total);
+    meta.textContent = `${from}–${to} of ${fmt(data.total)} captures`;
+    $("#caps-pos").textContent = data.total ? `${from}–${to} of ${fmt(data.total)}` : "—";
+    $("#caps-prev").disabled = caps.offset <= 0;
+    $("#caps-next").disabled = caps.offset + caps.limit >= data.total;
+  } catch (err) {
+    console.error(err);
+    meta.textContent = "query failed: " + err.message;
+  }
+}
+
+function renderCaps(root, rows) {
+  clear(root);
+  for (const r of rows) {
+    const li = el("li", {
+      class: "cap-row",
+      tabindex: "0",
+      role: "button",
+      "aria-label": `${r.title || "untitled"} — ${r.source_type}`,
+      dataset: { cid: r.capture_id },
+      onkeydown: (ev) => { if (ev.key === "Enter") openReader(r.capture_id); },
+      onclick: () => openReader(r.capture_id),
     });
-    if (!res.ok) {
-      let detail = res.statusText;
-      try { detail = (await res.json()).detail || detail; } catch (_) {}
-      throw new Error(res.status + " " + detail);
-    }
-    if (res.status === 204) return null;
-    return await res.json();
+    li.appendChild(el("div", { class: "cap-time", title: String(r.fetch_ts || "") }, ago(r.fetch_ts, true)));
+
+    const main = el("div", { class: "cap-main" });
+    main.appendChild(el("h3", { class: "cap-title", text: r.title || "(untitled)" }));
+    const m = el("div", { class: "cap-meta" });
+    m.appendChild(el("span", { class: "domain", text: r.domain || "—" }));
+    if (r.url) m.appendChild(el("span", { class: "url", text: r.url }));
+    main.appendChild(m);
+    li.appendChild(main);
+
+    li.appendChild(el("div", { class: "cap-source", text: r.source_type }));
+    li.appendChild(el("div", { class: "cap-size", text: fmt(r.text_len) + " ch" }));
+    root.appendChild(li);
+  }
+}
+
+// ── Reader drawer ─────────────────────────────────────────────
+let readerLastFocus = null;
+async function openReader(cid) {
+  const reader = $("#reader");
+  const scrim = $("#reader-scrim");
+  const body = $("#reader-body");
+  readerLastFocus = document.activeElement;
+  scrim.hidden = false;
+  reader.setAttribute("aria-hidden", "false");
+
+  clear(body);
+  body.appendChild(el("p", { class: "muted", text: "loading…" }));
+  let d;
+  try { d = await api("/captures/" + encodeURIComponent(cid)); }
+  catch (err) {
+    clear(body);
+    body.appendChild(el("p", { class: "muted", text: "failed: " + err.message }));
+    return;
   }
 
-  function pill(opts) {
-    const cls = "pill" + (opts.modifier ? " " + opts.modifier : "");
-    const span = el("span", { class: cls });
-    if (opts.live) span.appendChild(el("span", { class: "led" }));
-    if (opts.value != null) {
-      span.appendChild(el("b", { text: opts.value }));
-      span.appendChild(document.createTextNode(" " + opts.label));
+  clear(body);
+  body.appendChild(el("div", { class: "reader-eyebrow-source", text: (d.source_type || "") + " · " + (d.source_name || "") }));
+  body.appendChild(el("h1", { class: "reader-title", text: d.title || "(untitled)" }));
+
+  const byline = el("div", { class: "reader-byline" });
+  function bk(label, value, opts = {}) {
+    if (value == null || value === "") return;
+    const span = el("span");
+    span.appendChild(el("span", { class: "b-key", text: label }));
+    if (opts.link) {
+      const a = el("a", { href: value, target: "_blank", rel: "noopener" });
+      a.textContent = value;
+      span.appendChild(a);
     } else {
-      span.appendChild(document.createTextNode(opts.label));
+      span.appendChild(document.createTextNode(String(value)));
     }
-    return span;
+    byline.appendChild(span);
   }
+  bk("domain", d.domain);
+  bk("fetched", new Date(d.fetch_ts).toLocaleString());
+  if (d.published_ts) bk("published", new Date(d.published_ts).toLocaleString());
+  if (d.language) bk("lang", d.language);
+  if (d.url) bk("source", d.url, { link: true });
+  body.appendChild(byline);
 
-  // ── header / counters ──────────────────────────────────────────────
-  async function refreshHeader() {
-    let status, dedup;
-    try {
-      [status, dedup] = await Promise.all([api("/status"), api("/dedup-stats")]);
-    } catch (e) {
-      console.error("header refresh failed", e);
+  body.appendChild(el("div", { class: "reader-text", text: d.text || "(empty)" }));
+
+  const meta = el("div", { class: "reader-meta" });
+  meta.appendChild(el("div", { class: "reader-meta-title", text: "provenance & identity" }));
+  const dl = el("dl");
+  function metaRow(k, v) {
+    if (v == null || v === "") return;
+    dl.appendChild(el("dt", { text: k }));
+    dl.appendChild(el("dd", { text: String(v) }));
+  }
+  metaRow("doc_id", d.doc_id);
+  metaRow("capture_id", d.capture_id);
+  if (d.parent_doc_or_dup_group && d.parent_doc_or_dup_group !== d.doc_id)
+    metaRow("dup_group", d.parent_doc_or_dup_group);
+  metaRow("discovery", d.discovery_channel);
+  metaRow("canonical_url", d.canonical_url);
+  metaRow("content_hash", d.content_hash);
+  if (d.near_dup_hash != null) metaRow("near_dup_hash", d.near_dup_hash);
+  metaRow("robots", d.robots_decision);
+  meta.appendChild(dl);
+  body.appendChild(meta);
+
+  setTimeout(() => $("#reader-close").focus(), 80);
+}
+function closeReader() {
+  const reader = $("#reader");
+  const scrim = $("#reader-scrim");
+  reader.setAttribute("aria-hidden", "true");
+  scrim.hidden = true;
+  if (readerLastFocus && readerLastFocus.focus) readerLastFocus.focus();
+}
+
+// ── Jobs view (full) ──────────────────────────────────────────
+async function loadJobs() {
+  try {
+    const status = await api("/status");
+    renderJobsFull(status.jobs || []);
+  } catch (err) { console.error(err); }
+}
+
+function renderJobsFull(jobs) {
+  const root = $("#jobs-full");
+  clear(root);
+  if (!jobs.length) {
+    root.appendChild(el("p", { class: "muted", style: { padding: "22px 24px" } }, "No jobs yet — submit a backfill above or start the tail."));
+    return;
+  }
+  for (const j of jobs) {
+    const pct = j.tasks_total ? Math.round(100 * j.tasks_completed / j.tasks_total) : 0;
+    const idCell = el("div", { class: "job-id" });
+    idCell.appendChild(document.createTextNode(j.job_id));
+    idCell.appendChild(el("span", { class: "kind", text: j.kind }));
+
+    const progress = el("div", { class: "job-progress", role: "progressbar", "aria-valuenow": pct, "aria-valuemin": 0, "aria-valuemax": 100 });
+    progress.appendChild(el("div", { class: "job-progress-bar", style: { width: pct + "%" } }));
+
+    const counters = el("div", { class: "job-counters" });
+    counters.appendChild(document.createTextNode(`${j.tasks_completed}/${j.tasks_total} tasks · `));
+    counters.appendChild(el("b", { text: fmt(j.docs_emitted) }));
+    counters.appendChild(document.createTextNode(" docs · "));
+    counters.appendChild(el("b", { text: fmt(j.docs_dedup_dropped) }));
+    counters.appendChild(document.createTextNode(" folded · "));
+    counters.appendChild(document.createTextNode(j.started_at ? "started " + ago(j.started_at, false) : "queued"));
+
+    const badge = el("span", { class: "badge badge-" + j.status, text: j.status });
+
+    root.appendChild(el("div", { class: "job-row" }, idCell, progress, counters, badge));
+  }
+}
+
+// ── Backfill form ─────────────────────────────────────────────
+$("#bf-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const submit = e.target.querySelector('button[type=submit]');
+  submit.disabled = true;
+  try {
+    const start = $("#bf-start").value;
+    if (!start) { toast("pick a start date", "err"); return; }
+    const sources = $$("#bf-form input[type=checkbox]").filter((x) => x.checked).map((x) => x.value);
+    const domains = $("#bf-domains").value.split(",").map((s) => s.trim()).filter(Boolean);
+    const langs = $("#bf-langs").value.split(",").map((s) => s.trim()).filter(Boolean);
+    const max = parseInt($("#bf-max").value, 10);
+    const body = {
+      start: start,
+      end_str: $("#bf-end").value || "now",
+      sources: sources,
+      domains: domains.length ? domains : null,
+      languages: langs.length ? langs : null,
+      max_tasks: Number.isFinite(max) ? max : null,
+    };
+    const resp = await api("/backfill", { method: "POST", body: JSON.stringify(body) });
+    toast(`job ${resp.job_id} submitted (${resp.tasks_total} tasks)`, "ok");
+    await api(`/backfill/${encodeURIComponent(resp.job_id)}/run`, { method: "POST", body: "{}" });
+    toast(`job ${resp.job_id} running…`, "ok");
+    void loadJobs();
+    void refreshDashboard();
+  } catch (err) {
+    toast("backfill failed: " + err.message, "err");
+  } finally { submit.disabled = false; }
+});
+
+// ── Tail page ─────────────────────────────────────────────────
+async function loadTailView() {
+  let status;
+  try { status = await api("/status"); } catch (e) { console.error(e); return; }
+  const t = status.tail || {};
+  const big = $("#tail-big");
+  big.dataset.state = t.running ? "on" : "off";
+  $("#tail-big-state").textContent = t.running ? "running" : "stopped";
+  $("#tail-big-detail").textContent = t.running
+    ? "Reading public feeds. Newly discovered URLs are fetched politely, normalized to text, deduped, and written to the corpus."
+    : (t.stopped_at ? `Last live run ended ${ago(t.stopped_at, false)}.` : "No live capture has been started yet.");
+  $("#tail-big-meta").textContent = t.running
+    ? `job ${t.job_id || "—"} · started ${ago(t.started_at, false)}`
+    : (t.stopped_at ? `stopped at ${new Date(t.stopped_at).toLocaleString()}` : "");
+
+  // Seeds list (simple from configs/tail_seeds.yaml — we don't expose an API for it, so render placeholder)
+  const seeds = $("#seeds-block");
+  clear(seeds);
+  seeds.appendChild(el("p", { class: "muted" },
+    "Edit ", el("code", { text: "configs/tail_seeds.yaml" }),
+    " to change which feeds are read. The tail engine re-reads it every ",
+    el("code", { text: "tail_poll_seconds" }), "."));
+}
+
+// Bind tail buttons (both strip + big)
+for (const id of ["tail-start-btn", "tail-big-start"]) {
+  $("#" + id)?.addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try { await api("/tail/start", { method: "POST", body: "{}" }); toast("tail started", "ok"); }
+    catch (err) { toast("tail start failed: " + err.message, "err"); }
+    finally { e.target.disabled = false; void refreshDashboard(); void loadTailView(); }
+  });
+}
+for (const id of ["tail-stop-btn", "tail-big-stop"]) {
+  $("#" + id)?.addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try { await api("/tail/stop", { method: "POST", body: "{}" }); toast("tail paused", "ok"); }
+    catch (err) { toast("tail stop failed: " + err.message, "err"); }
+    finally { e.target.disabled = false; void refreshDashboard(); void loadTailView(); }
+  });
+}
+
+// ── Settings ──────────────────────────────────────────────────
+async function loadSettings() {
+  const root = $("#settings-block");
+  clear(root);
+  try {
+    const [health, dedup] = await Promise.all([api("/healthz"), api("/dedup-stats")]);
+    for (const [k, v] of Object.entries(health)) {
+      const row = el("div", { class: "kv-row" });
+      row.appendChild(el("div", { class: "kv-key", text: k }));
+      row.appendChild(el("div", { class: "kv-val", text: typeof v === "object" ? JSON.stringify(v) : String(v) }));
+      root.appendChild(row);
+    }
+    const dblock = $("#dedup-block");
+    clear(dblock);
+    for (const [k, v] of Object.entries(dedup)) {
+      const row = el("div", { class: "kv-row" });
+      row.appendChild(el("div", { class: "kv-key", text: k }));
+      row.appendChild(el("div", { class: "kv-val", text: String(v) }));
+      dblock.appendChild(row);
+    }
+  } catch (err) {
+    root.appendChild(el("p", { class: "muted", text: "failed: " + err.message }));
+  }
+}
+
+// ── Live activity feed (dashboard rail) ───────────────────────
+const FEED_MAX = 25;
+async function refreshFeed() {
+  try {
+    const data = await api(`/captures?limit=${FEED_MAX}&offset=0`);
+    const rows = data.rows || [];
+    if (rows.length === 0) {
+      $("#feed").replaceChildren();
+      $("#rail-empty").hidden = false;
+      $("#rail-sub").textContent = "no captures yet";
       return;
     }
-    const t = status.tail || {};
-    const docsTotal = (status.jobs || []).reduce((a, j) => a + (j.docs_emitted || 0), 0);
-    const jobsTotal = (status.jobs || []).length;
+    $("#rail-empty").hidden = true;
+    $("#rail-sub").textContent = `${fmt(data.total)} captures total`;
+    renderFeed(rows);
+  } catch (err) { console.error("feed", err); }
+}
 
-    const pills = $("#pills");
-    clear(pills);
-    if (t.running) {
-      const p = el("span", { class: "pill live" });
-      p.appendChild(el("span", { class: "led" }));
-      p.appendChild(document.createTextNode("tail · job "));
-      p.appendChild(document.createTextNode(t.job_id || "—"));
-      pills.appendChild(p);
-    } else {
-      pills.appendChild(el("span", { class: "pill off", text: "tail · stopped" }));
-    }
-    pills.appendChild(pill({ value: fmt(docsTotal), label: "docs across recent jobs" }));
-    pills.appendChild(pill({ value: fmt(dedup.distinct_content_hashes), label: "distinct hashes" }));
-    pills.appendChild(pill({ value: fmt(dedup.total_captures_seen), label: "total captures seen" }));
-    pills.appendChild(pill({ value: fmt(jobsTotal), label: "jobs" }));
-    $("#last-update").textContent = "updated " + new Date().toLocaleTimeString();
-
-    // Counters
-    const counters = $("#counters");
-    clear(counters);
-    function counter(label, value, sub) {
-      const c = el("div", { class: "counter" });
-      c.appendChild(el("div", { class: "label", text: label }));
-      c.appendChild(el("div", { class: "value", text: value }));
-      c.appendChild(el("div", { class: "sub", text: sub || "" }));
-      return c;
-    }
-    counters.appendChild(counter(
-      "tail", t.running ? "running" : "stopped",
-      t.started_at ? "since " + ago(t.started_at) : "—"
-    ));
-    counters.appendChild(counter(
-      "total captures", fmt(dedup.total_captures_seen),
-      fmt(dedup.distinct_content_hashes) + " unique"
-    ));
-    counters.appendChild(counter(
-      "docs emitted", fmt(docsTotal),
-      jobsTotal + " recent jobs"
-    ));
-    counters.appendChild(counter(
-      "dedup folds",
-      fmt(Math.max(0, dedup.total_captures_seen - dedup.distinct_content_hashes)),
-      fmt(dedup.near_dup_index_rows) + " simhash rows"
-    ));
-
-    // Tail status badge
-    const ts = $("#tail-status");
-    ts.classList.toggle("running", !!t.running);
-    ts.querySelector(".label").textContent = t.running ? "running" : "stopped";
-
-    const info = $("#tail-info");
-    clear(info);
-    if (t.running) {
-      info.appendChild(el("span", { class: "spin" }));
-      info.appendChild(document.createTextNode("job " + (t.job_id || "—") + " · started " + ago(t.started_at)));
-    } else if (t.stopped_at) {
-      info.appendChild(document.createTextNode("last stopped " + ago(t.stopped_at)));
-    }
-
-    renderJobs(status.jobs || []);
-  }
-
-  function renderJobs(jobs) {
-    const root = $("#jobs-list");
-    clear(root);
-    if (!jobs.length) {
-      const j = el("div", { class: "job" });
-      j.appendChild(el("span", { class: "empty", text: "no jobs yet" }));
-      root.appendChild(j);
-      return;
-    }
-    for (const j of jobs) {
-      const pct = j.tasks_total ? Math.round(100 * j.tasks_completed / j.tasks_total) : 0;
-      const jobEl = el("div", { class: "job" });
-      const idCell = el("div", { class: "id" });
-      idCell.appendChild(el("b", { text: j.job_id }));
-      idCell.appendChild(document.createTextNode(" "));
-      idCell.appendChild(el("span", { class: "small", text: j.kind }));
-      const statusCell = el("div");
-      statusCell.appendChild(el("span", { class: "status " + j.status, text: j.status }));
-      const stats = el("div", { class: "stats" });
-      stats.textContent =
-        j.tasks_completed + "/" + j.tasks_total + " tasks (" + pct + "%) · " +
-        fmt(j.docs_emitted) + " docs · " +
-        fmt(j.docs_dedup_dropped) + " folded · " +
-        (j.started_at ? "started " + ago(j.started_at) : "queued");
-      jobEl.appendChild(idCell);
-      jobEl.appendChild(statusCell);
-      jobEl.appendChild(stats);
-      root.appendChild(jobEl);
-    }
-  }
-
-  // ── tail controls ──────────────────────────────────────────────────
-  $("#tail-start").addEventListener("click", async (e) => {
-    e.target.disabled = true;
-    try {
-      await api("/tail/start", { method: "POST", body: "{}" });
-      toast("tail started", "ok");
-    } catch (err) { toast("tail start failed: " + err.message, "err"); }
-    finally { e.target.disabled = false; refreshHeader(); }
-  });
-
-  $("#tail-stop").addEventListener("click", async (e) => {
-    e.target.disabled = true;
-    try {
-      await api("/tail/stop", { method: "POST", body: "{}" });
-      toast("tail stop requested", "ok");
-    } catch (err) { toast("tail stop failed: " + err.message, "err"); }
-    finally { e.target.disabled = false; refreshHeader(); }
-  });
-
-  // ── backfill submit ────────────────────────────────────────────────
-  $("#bf-submit").addEventListener("click", async (e) => {
-    e.target.disabled = true;
-    try {
-      const start = $("#bf-start").value;
-      if (!start) { toast("pick a start date", "err"); return; }
-      const sources = Array.from($("#bf-sources").querySelectorAll("input[type=checkbox]"))
-        .filter((x) => x.checked).map((x) => x.value);
-      const domains = $("#bf-domains").value.split(",").map((s) => s.trim()).filter(Boolean);
-      const langs = $("#bf-langs").value.split(",").map((s) => s.trim()).filter(Boolean);
-      const max = parseInt($("#bf-max").value, 10);
-      const body = {
-        start: start,
-        end_str: $("#bf-end").value || "now",
-        sources: sources,
-        domains: domains.length ? domains : null,
-        languages: langs.length ? langs : null,
-        max_tasks: Number.isFinite(max) ? max : null,
-      };
-      const resp = await api("/backfill", { method: "POST", body: JSON.stringify(body) });
-      toast("job " + resp.job_id + " submitted (" + resp.tasks_total + " tasks)", "ok");
-      await api("/backfill/" + encodeURIComponent(resp.job_id) + "/run", { method: "POST", body: "{}" });
-      toast("job " + resp.job_id + " running…", "ok");
-    } catch (err) { toast("backfill failed: " + err.message, "err"); }
-    finally { e.target.disabled = false; refreshHeader(); }
-  });
-
-  $("#jobs-refresh").addEventListener("click", refreshHeader);
-
-  // ── captures table ────────────────────────────────────────────────
-  const cap = { limit: 50, offset: 0, total: 0 };
-
-  async function refreshCaptures() {
-    const params = new URLSearchParams();
-    params.set("limit", cap.limit);
-    params.set("offset", cap.offset);
-    const search = $("#cap-search").value.trim();
-    const source = $("#cap-source").value;
-    const domain = $("#cap-domain").value.trim();
-    const start = $("#cap-start").value;
-    const end = $("#cap-end").value;
-    if (search) params.set("search", search);
-    if (source) params.set("source", source);
-    if (domain) params.set("domain", domain);
-    if (start) params.set("start", start);
-    if (end) params.set("end", end);
-
-    try {
-      const data = await api("/captures?" + params.toString());
-      cap.total = data.total;
-      renderCaptures(data.rows);
-      const from = data.total ? cap.offset + 1 : 0;
-      const to = Math.min(cap.offset + data.rows.length, cap.total);
-      $("#cap-range").textContent = from + "–" + to + " of " + fmt(cap.total);
-      $("#cap-total").textContent = fmt(cap.total) + " rows";
-      $("#cap-prev").disabled = cap.offset <= 0;
-      $("#cap-next").disabled = cap.offset + cap.limit >= cap.total;
-    } catch (err) {
-      console.error(err);
-      const tb = $("#cap-body");
-      clear(tb);
-      const tr = el("tr", { class: "empty-row" });
-      tr.appendChild(el("td", { colspan: "6", text: "query failed: " + err.message }));
-      tb.appendChild(tr);
-    }
-  }
-
-  function renderCaptures(rows) {
-    const tb = $("#cap-body");
-    clear(tb);
-    if (!rows.length) {
-      const tr = el("tr", { class: "empty-row" });
-      tr.appendChild(el("td", { colspan: "6", text: "no captures match — try clearing filters or run a backfill" }));
-      tb.appendChild(tr);
-      return;
-    }
+function renderFeed(rows) {
+  const root = $("#feed");
+  // Diff: if first row's capture_id is new, animate it.
+  const prevFirst = lastFeedCaptureId;
+  const newFirst = rows[0]?.capture_id;
+  lastFeedCaptureId = newFirst;
+  const newCaptureIds = new Set();
+  if (prevFirst && newFirst !== prevFirst) {
     for (const r of rows) {
-      const tr = el("tr", { class: "row", dataset: { cid: r.capture_id } });
-      tr.appendChild(el("td", { class: "ts", title: String(r.fetch_ts || ""), text: ago(r.fetch_ts) }));
-      tr.appendChild(el("td", { class: "src", text: r.source_type }));
-      tr.appendChild(el("td", { class: "domain", text: r.domain || "—" }));
-      const titleCell = el("td", { class: "title" });
-      titleCell.appendChild(el("span", { class: "t", text: r.title || "(untitled)" }));
-      if (r.url) titleCell.appendChild(el("span", { class: "u", text: r.url }));
-      tr.appendChild(titleCell);
-      tr.appendChild(el("td", { style: { textAlign: "right" }, text: fmt(r.text_len) }));
-      tr.appendChild(el("td", { text: r.language || "—" }));
-      tr.addEventListener("click", () => openDetail(r.capture_id, tr));
-      tb.appendChild(tr);
+      if (r.capture_id === prevFirst) break;
+      newCaptureIds.add(r.capture_id);
     }
   }
+  clear(root);
+  for (const r of rows) {
+    const isNew = newCaptureIds.has(r.capture_id);
+    const item = el("li", { class: "feed-item" + (isNew ? " is-new" : "") });
+    item.appendChild(el("div", { class: "feed-bullet" }));
+    const inner = el("div");
+    inner.appendChild(el("div", { class: "feed-when", text: ago(r.fetch_ts, false) }));
+    const title = el("button", {
+      class: "feed-title",
+      style: { background: "transparent", border: "none", padding: 0, textAlign: "left" },
+      "aria-label": "Open " + (r.title || "capture"),
+      onclick: () => openReader(r.capture_id),
+    }, r.title || "(untitled)");
+    inner.appendChild(title);
+    const where = el("div", { class: "feed-where" });
+    where.appendChild(el("span", { class: "src", text: r.source_type }));
+    where.appendChild(document.createTextNode(" · "));
+    where.appendChild(el("span", { class: "dom", text: r.domain || "—" }));
+    inner.appendChild(where);
+    item.appendChild(inner);
+    root.appendChild(item);
+  }
+}
 
-  $("#cap-apply").addEventListener("click", () => { cap.offset = 0; refreshCaptures(); });
-  $("#cap-search").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { cap.offset = 0; refreshCaptures(); }
+// ── Command palette ───────────────────────────────────────────
+const cmdkOverlay = $("#cmdk");
+const cmdkInput = $("#cmdk-input");
+const cmdkList = $("#cmdk-list");
+let cmdkActive = 0;
+let cmdkResults = [];
+
+function buildCommands(query = "") {
+  const q = query.trim().toLowerCase();
+  const sections = [
+    { kind: "nav", icon: "◐", label: "Go to Dashboard", do: () => navigate("dashboard") },
+    { kind: "nav", icon: "≡", label: "Go to Captures",  do: () => navigate("captures") },
+    { kind: "nav", icon: "▱", label: "Go to Jobs",      do: () => navigate("jobs") },
+    { kind: "nav", icon: "⟳", label: "Go to Tail",      do: () => navigate("tail") },
+    { kind: "nav", icon: "⚙", label: "Go to Settings",  do: () => navigate("settings") },
+    { kind: "action", icon: "▶", label: "Start tail",   do: async () => { await api("/tail/start", { method: "POST", body: "{}" }); toast("tail started", "ok"); void refreshDashboard(); } },
+    { kind: "action", icon: "■", label: "Pause tail",   do: async () => { await api("/tail/stop", { method: "POST", body: "{}" }); toast("tail paused", "ok"); void refreshDashboard(); } },
+    { kind: "action", icon: "⌕", label: "Search captures…", do: () => { navigate("captures"); setTimeout(() => $("#caps-search").focus(), 200); } },
+  ];
+  if (!q) return sections;
+  if (q.length >= 2) {
+    // Local search shortcut → jump to captures with this query.
+    sections.unshift({ kind: "search", icon: "⌕", label: `Search corpus for "${query}"`, do: () => { navigate("captures"); $("#caps-search").value = query; void loadCaptures(true); } });
+  }
+  return sections.filter((c) => c.label.toLowerCase().includes(q) || c.kind.includes(q));
+}
+
+function openCmdk() {
+  cmdkOverlay.hidden = false;
+  cmdkInput.value = "";
+  cmdkActive = 0;
+  renderCmdk("");
+  setTimeout(() => cmdkInput.focus(), 30);
+}
+function closeCmdk() { cmdkOverlay.hidden = true; }
+function renderCmdk(q) {
+  cmdkResults = buildCommands(q);
+  clear(cmdkList);
+  if (cmdkResults.length === 0) {
+    cmdkList.appendChild(el("li", { class: "cmdk-empty" }, "no matches"));
+    return;
+  }
+  cmdkResults.forEach((c, i) => {
+    const li = el("li", { class: "cmdk-item" + (i === cmdkActive ? " is-active" : ""), role: "option", "aria-selected": i === cmdkActive ? "true" : "false" });
+    li.appendChild(el("span", { class: "cmdk-item-icon", text: c.icon }));
+    li.appendChild(el("span", { class: "cmdk-item-label", text: c.label }));
+    li.appendChild(el("span", { class: "cmdk-item-kind", text: c.kind }));
+    li.addEventListener("click", () => { closeCmdk(); c.do(); });
+    li.addEventListener("mouseenter", () => { cmdkActive = i; renderCmdk(q); });
+    cmdkList.appendChild(li);
   });
-  $("#cap-prev").addEventListener("click", () => { cap.offset = Math.max(0, cap.offset - cap.limit); refreshCaptures(); });
-  $("#cap-next").addEventListener("click", () => { cap.offset += cap.limit; refreshCaptures(); });
-  $("#cap-source").addEventListener("change", () => { cap.offset = 0; refreshCaptures(); });
+}
+cmdkInput?.addEventListener("input", (e) => { cmdkActive = 0; renderCmdk(e.target.value); });
+cmdkInput?.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); cmdkActive = Math.min(cmdkResults.length - 1, cmdkActive + 1); renderCmdk(cmdkInput.value); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); cmdkActive = Math.max(0, cmdkActive - 1); renderCmdk(cmdkInput.value); }
+  else if (e.key === "Enter") { e.preventDefault(); const c = cmdkResults[cmdkActive]; if (c) { closeCmdk(); c.do(); } }
+  else if (e.key === "Escape") { closeCmdk(); }
+});
+cmdkOverlay?.addEventListener("click", (e) => { if (e.target === cmdkOverlay) closeCmdk(); });
 
-  // ── detail drawer ──────────────────────────────────────────────────
-  async function openDetail(cid, tr) {
-    $$(".cap-table tr.row").forEach((x) => x.classList.remove("selected"));
-    if (tr) tr.classList.add("selected");
-    const body = $("#drawer-body");
-    clear(body);
-    body.appendChild(el("div", { class: "empty", text: "loading…" }));
-    $("#drawer").classList.add("open");
-    $("#scrim").classList.add("open");
-
-    let d;
-    try { d = await api("/captures/" + encodeURIComponent(cid)); }
-    catch (err) {
-      clear(body);
-      body.appendChild(el("div", { class: "empty", text: "failed: " + err.message }));
-      return;
+// ── Global keyboard shortcuts ─────────────────────────────────
+document.addEventListener("keydown", (e) => {
+  // Cmd/Ctrl+K → open palette
+  if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); openCmdk(); return; }
+  // "/" focus search (when on captures view)
+  if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    const tag = (document.activeElement?.tagName || "").toLowerCase();
+    if (tag !== "input" && tag !== "textarea" && tag !== "select") {
+      e.preventDefault();
+      if (currentRoute !== "captures") navigate("captures");
+      setTimeout(() => $("#caps-search").focus(), 80);
     }
-
-    clear(body);
-    body.appendChild(el("h3", { class: "title", text: d.title || "(untitled)" }));
-    const meta = el("dl", { class: "meta" });
-    function entry(label, value, opts) {
-      meta.appendChild(el("dt", { text: label }));
-      const dd = el("dd");
-      if (opts && opts.link && value) {
-        const a = el("a", { href: value, target: "_blank", rel: "noopener" });
-        a.textContent = value;
-        dd.appendChild(a);
-      } else {
-        dd.textContent = value == null ? "—" : String(value);
-      }
-      meta.appendChild(dd);
-    }
-    entry("doc_id", d.doc_id);
-    entry("capture_id", d.capture_id);
-    if (d.parent_doc_or_dup_group && d.parent_doc_or_dup_group !== d.doc_id) {
-      entry("dup_group", d.parent_doc_or_dup_group);
-    }
-    entry("source", d.source_type + " · " + d.source_name);
-    entry("discovery", d.discovery_channel);
-    entry("domain", d.domain);
-    entry("url", d.url, { link: true });
-    entry("fetch_ts", d.fetch_ts);
-    entry("observed_ts", d.observed_ts);
-    if (d.published_ts) entry("published", d.published_ts);
-    entry("language", d.language);
-    entry("content_hash", d.content_hash);
-    if (d.near_dup_hash != null) entry("near_dup_hash", String(d.near_dup_hash));
-    entry("robots", d.robots_decision);
-    body.appendChild(meta);
-
-    const text = el("div", { class: "text", text: d.text || "(empty)" });
-    body.appendChild(text);
   }
-
-  function closeDrawer() {
-    $("#drawer").classList.remove("open");
-    $("#scrim").classList.remove("open");
-    $$(".cap-table tr.row").forEach((x) => x.classList.remove("selected"));
+  // Number shortcuts 1..5 for routes (when not typing)
+  if (/^[1-5]$/.test(e.key) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    const tag = (document.activeElement?.tagName || "").toLowerCase();
+    if (tag !== "input" && tag !== "textarea" && tag !== "select") {
+      navigate(ROUTES[parseInt(e.key, 10) - 1]);
+    }
   }
+  // Esc: close any overlay
+  if (e.key === "Escape") {
+    if (!cmdkOverlay.hidden) closeCmdk();
+    else if ($("#reader").getAttribute("aria-hidden") === "false") closeReader();
+    else if ($(".sidebar").classList.contains("is-open")) $(".sidebar").classList.remove("is-open");
+  }
+});
 
-  $("#drawer-close").addEventListener("click", closeDrawer);
-  $("#scrim").addEventListener("click", closeDrawer);
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+// ── Bind nav buttons ─────────────────────────────────────────
+$$(".nav-item").forEach((b) => {
+  b.addEventListener("click", () => navigate(b.dataset.route));
+});
+$$('[data-route]').forEach((b) => {
+  if (b.classList.contains("nav-item")) return;
+  b.addEventListener("click", (e) => { e.preventDefault(); navigate(b.dataset.route); });
+});
+$('[data-action="open-cmdk"]')?.addEventListener("click", openCmdk);
+$("#reader-close")?.addEventListener("click", closeReader);
+$("#reader-scrim")?.addEventListener("click", closeReader);
 
-  // ── boot ──────────────────────────────────────────────────────────
-  $("#bf-start").value = isoDay(Date.now() - 30 * 86400 * 1000);
-  refreshHeader();
-  refreshCaptures();
-  setInterval(refreshHeader, 4000);
-  setInterval(() => { if (!$("#drawer").classList.contains("open")) refreshCaptures(); }, 6000);
-})();
+// Captures bindings
+$("#caps-apply")?.addEventListener("click", () => loadCaptures(true));
+$("#caps-reset")?.addEventListener("click", () => {
+  $("#caps-search").value = "";
+  $("#caps-source").value = "";
+  $("#caps-domain").value = "";
+  $("#caps-start").value = "";
+  $("#caps-end").value = "";
+  loadCaptures(true);
+});
+$("#caps-search")?.addEventListener("input", () => {
+  clearTimeout(capsSearchTimer);
+  capsSearchTimer = setTimeout(() => loadCaptures(true), 300);
+});
+$("#caps-source")?.addEventListener("change", () => loadCaptures(true));
+$("#caps-prev")?.addEventListener("click", () => { caps.offset = Math.max(0, caps.offset - caps.limit); loadCaptures(false); });
+$("#caps-next")?.addEventListener("click", () => { caps.offset += caps.limit; loadCaptures(false); });
+$("#jobs-refresh")?.addEventListener("click", () => loadJobs());
+
+// Mobile nav
+$("#mobile-nav-btn")?.addEventListener("click", () => {
+  const sb = $(".sidebar");
+  const open = sb.classList.toggle("is-open");
+  $("#mobile-nav-btn").setAttribute("aria-expanded", String(open));
+});
+
+// ── Boot ──────────────────────────────────────────────────────
+const initialRoute = (location.hash || "#dashboard").slice(1);
+$("#bf-start") && ($("#bf-start").value = isoDay(Date.now() - 30 * 86400 * 1000));
+navigate(initialRoute, { push: false });
+void refreshDashboard();
+void refreshFeed();
+setInterval(refreshDashboard, 5000);
+setInterval(refreshFeed, 5000);
