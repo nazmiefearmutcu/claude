@@ -1,6 +1,7 @@
 """FastAPI HTTP control surface.
 
 Endpoints:
+    GET  /                       — web dashboard (static SPA)
     GET  /healthz                — liveness
     GET  /status                 — overall status
     GET  /metrics                — counters/histograms snapshot
@@ -12,6 +13,8 @@ Endpoints:
     POST /tail/stop              — stop tail
     GET  /tail                   — tail state
     GET  /inspect                — date/domain/source range query
+    GET  /captures               — paginated capture listing for UI
+    GET  /captures/{capture_id}  — full capture (incl. text) for UI detail view
     GET  /counts                 — counts grouped by source & domain
     GET  /dedup-stats            — dedup index stats
 
@@ -24,9 +27,12 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 
@@ -228,7 +234,94 @@ def create_app() -> FastAPI:
             "SELECT source_type, COUNT(*) AS n FROM captures WHERE fetch_ts BETWEEN $start AND $end GROUP BY source_type",
             p,
         )
-        return {"total": total, "by_source": by_source}
+        by_domain = idx.execute(
+            "SELECT domain, COUNT(*) AS n FROM captures WHERE fetch_ts BETWEEN $start AND $end AND domain IS NOT NULL GROUP BY domain ORDER BY n DESC LIMIT 25",
+            p,
+        )
+        return {"total": total, "by_source": by_source, "by_domain": by_domain}
+
+    @app.get("/captures")
+    def list_captures(
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        start: Optional[datetime] = Query(None),
+        end: Optional[datetime] = Query(None),
+        domain: Optional[str] = Query(None),
+        source: Optional[str] = Query(None),
+        search: Optional[str] = Query(None),
+    ) -> dict[str, Any]:
+        s = get_settings()
+        idx = DuckDbIndex(
+            db_path=s.duckdb_path(),
+            jsonl_dir=s.staging_jsonl_dir(),
+            iceberg_warehouse=s.iceberg_warehouse,
+        )
+        where: list[str] = []
+        params: dict[str, Any] = {}
+        if start is not None:
+            where.append("fetch_ts >= $start")
+            params["start"] = to_utc(start)
+        if end is not None:
+            where.append("fetch_ts <= $end")
+            params["end"] = to_utc(end)
+        if domain:
+            where.append("domain = $dom")
+            params["dom"] = domain
+        if source:
+            where.append("source_type = $src")
+            params["src"] = source
+        if search:
+            where.append("(title ILIKE $q OR text ILIKE $q)")
+            params["q"] = f"%{search}%"
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+        total = idx.execute(f"SELECT COUNT(*) AS n FROM captures{where_sql}", params)
+        rows = idx.execute(
+            f"""
+            SELECT
+              doc_id, capture_id, source_type, source_name,
+              fetch_ts, observed_ts, domain, url, canonical_url,
+              title, language, length(text) AS text_len,
+              content_hash, parent_doc_or_dup_group
+            FROM captures{where_sql}
+            ORDER BY fetch_ts DESC
+            LIMIT {int(limit)} OFFSET {int(offset)}
+            """,
+            params,
+        )
+        return {
+            "total": int(total[0]["n"]) if total else 0,
+            "limit": limit,
+            "offset": offset,
+            "rows": rows,
+        }
+
+    @app.get("/captures/{capture_id}")
+    def capture_detail(capture_id: str) -> dict[str, Any]:
+        s = get_settings()
+        idx = DuckDbIndex(
+            db_path=s.duckdb_path(),
+            jsonl_dir=s.staging_jsonl_dir(),
+            iceberg_warehouse=s.iceberg_warehouse,
+        )
+        rows = idx.execute(
+            """
+            SELECT * FROM captures WHERE capture_id = $cid LIMIT 1
+            """,
+            {"cid": capture_id},
+        )
+        if not rows:
+            raise HTTPException(404, "capture not found")
+        return rows[0]
+
+    # ── static dashboard ─────────────────────────────────────────────────
+    web_dir = Path(__file__).resolve().parent / "web"
+    if web_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
+
+        @app.get("/", include_in_schema=False)
+        def root_index() -> FileResponse:
+            return FileResponse(str(web_dir / "index.html"))
 
     return app
 

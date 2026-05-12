@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>awareness — dashboard</title>
+<link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='%2336d399'/><circle cx='32' cy='32' r='12' fill='%23052b1f'/></svg>" />
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<header>
+  <h1><span class="dot"></span>awareness</h1>
+  <div class="pills" id="pills"></div>
+  <div class="small" id="last-update"></div>
+</header>
+
+<main>
+  <div>
+    <div class="counters" id="counters"></div>
+
+    <section class="panel">
+      <header class="p-head">
+        <span>Tail &middot; live capture</span>
+        <span class="tail-status" id="tail-status"><span class="indicator"></span><span class="label">—</span></span>
+      </header>
+      <div class="body">
+        <p class="small">Reads the seed feeds in <code>configs/tail_seeds.yaml</code> every <code>tail_poll_seconds</code>. Stops cleanly on demand and resumes from checkpoints.</p>
+        <div class="actions">
+          <button class="primary" id="tail-start">Start</button>
+          <button class="danger" id="tail-stop">Stop</button>
+        </div>
+        <p class="small" id="tail-info" style="margin-top:10px"></p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header class="p-head"><span>Body &middot; historical backfill</span></header>
+      <div class="body">
+        <div class="row"><label>Start</label><input id="bf-start" type="date" /></div>
+        <div class="row"><label>End</label><input id="bf-end" type="text" placeholder="now" value="now" /></div>
+        <div class="row"><label>Sources</label>
+          <div class="checks full" id="bf-sources">
+            <label><input type="checkbox" value="common_crawl_wet" /> CC-WET</label>
+            <label><input type="checkbox" value="fineweb" /> FineWeb</label>
+            <label><input type="checkbox" value="fineweb_2" /> FineWeb-2</label>
+            <label><input type="checkbox" value="gdelt" /> GDELT</label>
+            <label><input type="checkbox" value="common_crawl_index" /> CC-Index</label>
+            <label><input type="checkbox" value="rss" /> RSS</label>
+          </div>
+        </div>
+        <div class="row"><label>Domains</label><input id="bf-domains" placeholder="bbc.com, reuters.com (optional)" /></div>
+        <div class="row"><label>Languages</label><input id="bf-langs" placeholder="en, tr (optional)" /></div>
+        <div class="row"><label>Max tasks</label><input id="bf-max" type="number" min="1" placeholder="(unlimited)" /></div>
+        <div class="actions">
+          <button class="primary" id="bf-submit">Submit + run</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header class="p-head">
+        <span>Recent jobs</span>
+        <button id="jobs-refresh" style="padding:2px 8px;font-size:11px">refresh</button>
+      </header>
+      <div class="jobs-list" id="jobs-list">
+        <div class="job"><span class="empty">loading…</span></div>
+      </div>
+    </section>
+  </div>
+
+  <div>
+    <section class="panel" style="margin-bottom:0">
+      <header class="p-head">
+        <span>Captures</span>
+        <span class="small" id="cap-total"></span>
+      </header>
+      <div class="cap-controls">
+        <input id="cap-search" type="search" placeholder="search title/text…" />
+        <select id="cap-source">
+          <option value="">all sources</option>
+          <option value="tail_recrawl">tail_recrawl</option>
+          <option value="common_crawl_wet">common_crawl_wet</option>
+          <option value="common_crawl_warc">common_crawl_warc</option>
+          <option value="fineweb">fineweb</option>
+          <option value="fineweb_2">fineweb_2</option>
+          <option value="gdelt">gdelt</option>
+          <option value="local_fixture">local_fixture</option>
+        </select>
+        <input id="cap-domain" type="text" placeholder="domain…" style="width:140px" />
+        <input id="cap-start" type="date" />
+        <input id="cap-end" type="date" />
+        <button id="cap-apply">apply</button>
+      </div>
+      <table class="cap-table">
+        <thead><tr>
+          <th style="width:90px">when</th>
+          <th style="width:120px">source</th>
+          <th style="width:140px">domain</th>
+          <th>title</th>
+          <th style="width:60px;text-align:right">chars</th>
+          <th style="width:50px">lang</th>
+        </tr></thead>
+        <tbody id="cap-body">
+          <tr class="empty-row"><td colspan="6">no captures yet — submit a backfill or start the tail to populate</td></tr>
+        </tbody>
+      </table>
+      <div class="cap-pagination">
+        <span id="cap-range">—</span>
+        <div class="controls">
+          <button id="cap-prev">‹ prev</button>
+          <button id="cap-next">next ›</button>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <h2>capture detail</h2>
+    <button id="drawer-close">close</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
