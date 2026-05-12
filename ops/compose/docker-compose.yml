@@ -1,0 +1,112 @@
+# Optional production-style stack for Awareness.
+#
+# Local dev: Awareness runs with SQLite + DuckDB + Iceberg on local files. No
+# daemons required. Use this compose file when you want the same code wired to
+# Postgres (state DB), Redpanda (event bus), MinIO (S3 warehouse), and
+# ClickHouse (analytics over Parquet/Iceberg).
+#
+# Bring it up with:   docker compose -f ops/compose/docker-compose.yml up -d
+# Stop:               docker compose -f ops/compose/docker-compose.yml down
+#
+# Awareness configuration env to point at this stack:
+#   AW_STATE_DB_URL=postgresql+psycopg://awareness:awareness@localhost:5432/awareness
+#   AW_ICEBERG_WAREHOUSE=s3://awareness/warehouse
+#   (S3 endpoint / creds picked up by PyIceberg via S3 env vars)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: awareness
+      POSTGRES_PASSWORD: awareness
+      POSTGRES_DB: awareness
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U awareness"]
+      interval: 5s
+      retries: 10
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.4
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+      - --schema-registry-addr=0.0.0.0:8081
+    ports:
+      - "9092:9092"
+      - "8081:8081"
+      - "8082:8082"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: awareness
+      MINIO_ROOT_PASSWORD: awareness12345
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      retries: 6
+
+  # One-shot job to provision the awareness/warehouse bucket on first boot.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - sh
+      - -c
+      - |
+        until /usr/bin/mc alias set local http://minio:9000 awareness awareness12345; do
+          echo "waiting for minio";
+          sleep 1;
+        done;
+        /usr/bin/mc mb -p local/awareness || true;
+        /usr/bin/mc anonymous set download local/awareness || true;
+        echo "minio ready"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.10
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: awareness
+      CLICKHOUSE_USER: awareness
+      CLICKHOUSE_PASSWORD: awareness
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9001:9001"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  postgres_data: {}
+  redpanda_data: {}
+  minio_data: {}
+  clickhouse_data: {}

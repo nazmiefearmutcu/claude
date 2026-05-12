@@ -1,0 +1,5 @@
+feeds:
+  - { url: "https://hnrss.org/frontpage" }
+  - { url: "https://feeds.bbci.co.uk/news/world/rss.xml" }
+atom: []
+sitemaps: []

@@ -1,0 +1,36 @@
+# Awareness runtime configuration.
+# Any value here can be overridden by an environment variable AW_* (matching
+# the Settings field name, case-insensitive). See src/awareness/config/settings.py.
+
+ingest_version: "0.1.0"
+user_agent: "AwarenessBot/0.1 (+https://github.com/nazmiefearmutcu/desktop-tutorial; public-text-research)"
+contact_email: "research@example.invalid"
+
+# Politeness
+per_domain_concurrency: 2
+per_domain_delay_sec: 1.0
+robots_cache_ttl_sec: 3600
+global_fetch_concurrency: 32
+max_retries: 4
+
+# Runtime / scheduler
+worker_concurrency: 4
+extract_concurrency: 2
+storage_flush_records: 200
+storage_flush_seconds: 10
+bounded_queue_size: 1024
+
+# Tail
+tail_poll_seconds: 60
+
+# Corpus filters
+text_min_chars: 200
+text_max_chars: 1500000
+
+# Storage
+enable_iceberg: true
+enable_jsonl_staging: true
+
+# Observability
+log_level: "INFO"
+log_json: true
