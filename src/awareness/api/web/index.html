@@ -18,6 +18,16 @@
 
 <div class="grain" aria-hidden="true"></div>
 
+<div class="api-offline" id="api-offline" role="alert" hidden>
+  <span class="api-offline-dot" aria-hidden="true"></span>
+  <div class="api-offline-text">
+    <strong>API offline.</strong>
+    <span class="api-offline-msg">API unreachable — start it with <code>awareness-api</code>, or check the port.</span>
+    <span class="api-offline-why" aria-live="polite"></span>
+  </div>
+  <button class="api-offline-retry" id="api-offline-retry">retry</button>
+</div>
+
 <div class="app">
 
   <aside class="sidebar" role="navigation" aria-label="Primary">

@@ -55,16 +55,54 @@ function toast(msg, kind = "ok") {
 }
 
 // ── API ───────────────────────────────────────────────────────
+// Connection health: if N consecutive fetches fail with a network error
+// (server down, CORS, DNS, etc.) show a persistent offline banner; clear
+// it as soon as one fetch succeeds.
+const apiHealth = { failures: 0, threshold: 2, offline: false };
+
+function setOffline(offline, reason) {
+  if (offline === apiHealth.offline) return;
+  apiHealth.offline = offline;
+  const banner = $("#api-offline");
+  if (!banner) return;
+  if (offline) {
+    banner.hidden = false;
+    const msg = banner.querySelector(".api-offline-msg");
+    if (msg) msg.textContent = "API unreachable — start it with `awareness-api`, or check the port.";
+    const why = banner.querySelector(".api-offline-why");
+    if (why) why.textContent = reason || "";
+  } else {
+    banner.hidden = true;
+  }
+}
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-    ...opts,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      ...opts,
+    });
+  } catch (netErr) {
+    // Network-level failure: server down, CORS, DNS. fetch() rejects with
+    // a TypeError "Failed to fetch" — not an HTTP status we can read.
+    apiHealth.failures += 1;
+    if (apiHealth.failures >= apiHealth.threshold) {
+      setOffline(true, netErr.message || "network error");
+    }
+    throw new Error("API unreachable: " + (netErr.message || "network error"));
+  }
   if (!res.ok) {
+    // We DID reach the server; not an "offline" condition.
+    apiHealth.failures = 0;
+    setOffline(false);
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch (_) {}
     throw new Error(res.status + " " + detail);
   }
+  // Healthy response — clear any offline state.
+  apiHealth.failures = 0;
+  setOffline(false);
   if (res.status === 204) return null;
   return await res.json();
 }
@@ -924,6 +962,26 @@ $("#mobile-nav-btn")?.addEventListener("click", () => {
   const sb = $(".sidebar");
   const open = sb.classList.toggle("is-open");
   $("#mobile-nav-btn").setAttribute("aria-expanded", String(open));
+});
+
+// API offline retry button — re-probes /healthz; the next successful
+// api() call clears the banner automatically.
+$("#api-offline-retry")?.addEventListener("click", async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
+  btn.textContent = "checking…";
+  try {
+    await api("/healthz");
+    // success — banner already cleared by api() itself.
+    void refreshDashboard();
+    void refreshFeed();
+    if (currentRoute === "tail") void loadTailView();
+  } catch (_) {
+    // still offline — banner remains.
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "retry";
+  }
 });
 
 // ── Boot ──────────────────────────────────────────────────────
