@@ -126,7 +126,7 @@ function navigate(route, { push = true } = {}) {
   // Lazy-load views' data on activation.
   if (route === "captures") void loadCaptures(true);
   if (route === "jobs") void loadJobs();
-  if (route === "tail") void loadTailView();
+  if (route === "tail") startTailPolling();
   if (route === "settings") void loadSettings();
 }
 window.addEventListener("popstate", (e) => {
@@ -527,11 +527,26 @@ $("#bf-form")?.addEventListener("submit", async (e) => {
   } finally { submit.disabled = false; }
 });
 
-// ── Tail page ─────────────────────────────────────────────────
+// ── Tail page (rich live status) ──────────────────────────────
+let tailPollTimer = null;
+function startTailPolling() {
+  if (tailPollTimer) return;
+  loadTailView();
+  tailPollTimer = setInterval(() => {
+    if (currentRoute === "tail") loadTailView();
+    else { clearInterval(tailPollTimer); tailPollTimer = null; }
+  }, 2000);
+}
+
 async function loadTailView() {
-  let status;
-  try { status = await api("/status"); } catch (e) { console.error(e); return; }
-  const t = status.tail || {};
+  let data;
+  try { data = await api("/tail/status"); } catch (e) { console.error(e); return; }
+  const t = data.tail || {};
+  const job = data.job || {};
+  const counts = data.task_status_counts || {};
+  const seed = data.per_seed || { feeds: [], fetch: {} };
+
+  // Hero
   const big = $("#tail-big");
   big.dataset.state = t.running ? "on" : "off";
   $("#tail-big-state").textContent = t.running ? "running" : "stopped";
@@ -542,13 +557,133 @@ async function loadTailView() {
     ? `job ${t.job_id || "—"} · started ${ago(t.started_at, false)}`
     : (t.stopped_at ? `stopped at ${new Date(t.stopped_at).toLocaleString()}` : "");
 
-  // Seeds list (simple from configs/tail_seeds.yaml — we don't expose an API for it, so render placeholder)
-  const seeds = $("#seeds-block");
-  clear(seeds);
-  seeds.appendChild(el("p", { class: "muted" },
-    "Edit ", el("code", { text: "configs/tail_seeds.yaml" }),
-    " to change which feeds are read. The tail engine re-reads it every ",
-    el("code", { text: "tail_poll_seconds" }), "."));
+  // Progress bar + counters
+  const total = Number(job.tasks_total || 0);
+  const done = Number(job.tasks_completed || 0);
+  const pct = total ? Math.round(100 * done / total) : 0;
+  $("#tail-progress-fill").style.width = pct + "%";
+  $("#tail-progress-meta").textContent = total
+    ? `${done}/${total} tasks · ${pct}%`
+    : (t.running ? "queue empty" : "no active job");
+
+  const cwrap = $("#tail-counters");
+  clear(cwrap);
+  function ctr(label, value, kind = "") {
+    const c = el("div", { class: "ctr " + kind });
+    c.appendChild(el("span", { class: "ctr-num", text: fmt(value) }));
+    c.appendChild(el("span", { class: "ctr-lbl", text: label }));
+    return c;
+  }
+  cwrap.appendChild(ctr("pending", counts.pending || 0, "ctr-pending"));
+  cwrap.appendChild(ctr("fetching", counts.running || 0, "ctr-running"));
+  cwrap.appendChild(ctr("completed", counts.completed || 0, "ctr-done"));
+  cwrap.appendChild(ctr("docs captured", job.docs_emitted || 0, "ctr-docs"));
+  cwrap.appendChild(ctr("folded", job.docs_dedup_dropped || 0, "ctr-folded"));
+  if (counts.failed) cwrap.appendChild(ctr("failed", counts.failed, "ctr-failed"));
+
+  // Now fetching
+  const nowList = $("#tail-now-list");
+  const running = data.running_tasks || [];
+  clear(nowList);
+  $("#tail-now-meta").textContent = running.length ? `${running.length} in flight` : "idle";
+  if (running.length === 0) {
+    nowList.appendChild(el("li", { class: "muted-li" }, t.running ? "Idle. Next poll in ≤ tail_poll_seconds." : "Tail is stopped."));
+  } else {
+    for (const r of running) {
+      const li = el("li", { class: "tn-row" });
+      li.appendChild(el("span", { class: "tn-spin", "aria-hidden": "true" }));
+      li.appendChild(el("span", { class: "tn-source", text: r.source_type }));
+      li.appendChild(el("span", { class: "tn-target", title: r.partition_key, text: shortPartition(r.partition_key) }));
+      li.appendChild(el("span", { class: "tn-elapsed", text: r.started_at ? ago(r.started_at, true) : "" }));
+      nowList.appendChild(li);
+    }
+  }
+
+  // Just captured
+  const doneList = $("#tail-done-list");
+  const recent = data.recent_completed || [];
+  clear(doneList);
+  $("#tail-done-meta").textContent = recent.length ? `${recent.length} recent` : "—";
+  if (recent.length === 0) {
+    doneList.appendChild(el("li", { class: "muted-li" }, "No completed fetches yet."));
+  } else {
+    for (const r of recent) {
+      const li = el("li", { class: "tn-row" });
+      li.appendChild(el("span", { class: "tn-tick", "aria-hidden": "true" }, "✓"));
+      li.appendChild(el("span", { class: "tn-source", text: r.source_type }));
+      li.appendChild(el("span", { class: "tn-target", title: r.partition_key, text: shortPartition(r.partition_key) }));
+      const meta = el("span", { class: "tn-result" });
+      meta.appendChild(document.createTextNode(`${r.docs_emitted || 0} doc`));
+      if (r.docs_dedup_dropped) meta.appendChild(document.createTextNode(` · ${r.docs_dedup_dropped} folded`));
+      li.appendChild(meta);
+      li.appendChild(el("span", { class: "tn-elapsed", text: r.completed_at ? ago(r.completed_at, true) : "" }));
+      doneList.appendChild(li);
+    }
+  }
+
+  // Recent chunks
+  const chunksList = $("#tail-chunks-list");
+  const chunks = data.recent_chunks || [];
+  clear(chunksList);
+  if (chunks.length === 0) {
+    chunksList.appendChild(el("li", { class: "muted-li" }, "No JSONL chunks committed yet."));
+  } else {
+    for (const c of chunks) {
+      const li = el("li", { class: "tc-row" });
+      li.appendChild(el("span", { class: "tc-ic", "aria-hidden": "true" }, "▢"));
+      li.appendChild(el("span", { class: "tc-records", text: fmt(c.records) + " records" }));
+      li.appendChild(el("span", { class: "tc-bytes", text: fmtBytes(c.bytes) }));
+      li.appendChild(el("span", { class: "tc-path", title: c.path, text: shortPath(c.path) }));
+      li.appendChild(el("span", { class: "tc-when", text: c.committed_at ? ago(c.committed_at, true) : "" }));
+      chunksList.appendChild(li);
+    }
+  }
+
+  // Seeds
+  const seedsBlock = $("#seeds-block");
+  clear(seedsBlock);
+  $("#seeds-meta").textContent = `${seed.feeds.length} configured · fetch: ${
+    Object.entries(seed.fetch || {}).map(([k, v]) => `${v} ${k}`).join(", ") || "none"
+  }`;
+  if (!seed.feeds.length) {
+    seedsBlock.appendChild(el("p", { class: "muted" },
+      "Edit ", el("code", { text: "configs/tail_seeds.yaml" }),
+      " to change which feeds are read."));
+  } else {
+    const ul = el("ul", { class: "seeds-list" });
+    for (const f of seed.feeds) {
+      const li = el("li", { class: "seed-row" });
+      const kind = f.partition_key.split(":", 1)[0];
+      const url = f.partition_key.slice(kind.length + 1);
+      li.appendChild(el("span", { class: "seed-kind", text: kind }));
+      li.appendChild(el("span", { class: "seed-url", title: url, text: url }));
+      li.appendChild(el("span", { class: "seed-status badge badge-" + f.status, text: f.status }));
+      ul.appendChild(li);
+    }
+    seedsBlock.appendChild(ul);
+  }
+}
+
+function shortPartition(pk) {
+  if (!pk) return "";
+  const idx = pk.indexOf("://");
+  if (idx < 0) return pk;
+  const url = pk.slice(pk.indexOf(":") + 1);
+  try {
+    const u = new URL(url);
+    return u.host + (u.pathname.length > 30 ? u.pathname.slice(0, 27) + "…" : u.pathname);
+  } catch { return url.slice(0, 80); }
+}
+function shortPath(p) {
+  if (!p) return "";
+  const parts = p.split("/");
+  return parts.slice(-3).join("/");
+}
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
 }
 
 // Bind tail buttons (both strip + big)

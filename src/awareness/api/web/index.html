@@ -294,9 +294,53 @@
         </div>
       </div>
 
+      <section class="band" aria-labelledby="tail-progress-title">
+        <header class="band-head">
+          <h2 id="tail-progress-title" class="band-title"><span class="serif-i">queue</span> · progress</h2>
+          <div class="band-meta" id="tail-progress-meta">—</div>
+        </header>
+        <div class="tail-progress" id="tail-progress">
+          <div class="tail-progress-bar"><div class="tail-progress-fill" id="tail-progress-fill" style="width:0%"></div></div>
+          <div class="tail-counters" id="tail-counters">—</div>
+        </div>
+      </section>
+
+      <div class="tail-cols">
+        <section class="band" aria-labelledby="tail-now-title">
+          <header class="band-head">
+            <h2 id="tail-now-title" class="band-title"><span class="serif-i">now</span> fetching</h2>
+            <div class="band-meta" id="tail-now-meta">—</div>
+          </header>
+          <ol class="tail-now-list" id="tail-now-list" aria-live="polite">
+            <li class="muted-li">No fetches in flight.</li>
+          </ol>
+        </section>
+
+        <section class="band" aria-labelledby="tail-done-title">
+          <header class="band-head">
+            <h2 id="tail-done-title" class="band-title"><span class="serif-i">just</span> captured</h2>
+            <div class="band-meta" id="tail-done-meta">—</div>
+          </header>
+          <ol class="tail-done-list" id="tail-done-list">
+            <li class="muted-li">No completed fetches yet.</li>
+          </ol>
+        </section>
+      </div>
+
+      <section class="band" aria-labelledby="tail-chunks-title">
+        <header class="band-head">
+          <h2 id="tail-chunks-title" class="band-title"><span class="serif-i">storage</span> · last commits</h2>
+          <div class="band-meta">JSONL chunks written by the worker</div>
+        </header>
+        <ol class="tail-chunks-list" id="tail-chunks-list">
+          <li class="muted-li">No chunks committed yet.</li>
+        </ol>
+      </section>
+
       <section class="band" aria-labelledby="seeds-title">
         <header class="band-head">
           <h2 id="seeds-title" class="band-title"><span class="serif-i">seeds</span></h2>
+          <div class="band-meta" id="seeds-meta">—</div>
         </header>
         <div class="seeds" id="seeds-block">
           <p class="muted">Loading seeds…</p>

@@ -378,6 +378,104 @@ class StateDB:
             )
             return {status: int(n) for status, n in s.execute(stmt).all()}
 
+    def list_running_tasks(self, job_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Return tasks currently in RUNNING state for a job, newest started first."""
+        with self.session() as s:
+            stmt = (
+                select(TaskRow)
+                .where(TaskRow.job_id == job_id, TaskRow.status == TaskStatus.RUNNING.value)
+                .order_by(TaskRow.started_at.desc().nullslast())
+                .limit(limit)
+            )
+            return [
+                {
+                    "task_id": r.task_id,
+                    "source_type": r.source_type,
+                    "partition_key": r.partition_key,
+                    "started_at": r.started_at.isoformat() if r.started_at else None,
+                    "attempts": r.attempts,
+                }
+                for r in s.scalars(stmt)
+            ]
+
+    def list_recent_completed_tasks(self, job_id: str, limit: int = 12) -> list[dict[str, Any]]:
+        """Return most recently completed tasks for a job, latest first."""
+        with self.session() as s:
+            stmt = (
+                select(TaskRow)
+                .where(TaskRow.job_id == job_id, TaskRow.status == TaskStatus.COMPLETED.value)
+                .order_by(TaskRow.completed_at.desc().nullslast())
+                .limit(limit)
+            )
+            return [
+                {
+                    "task_id": r.task_id,
+                    "source_type": r.source_type,
+                    "partition_key": r.partition_key,
+                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                    "docs_emitted": r.docs_emitted,
+                    "docs_dedup_dropped": r.docs_dedup_dropped,
+                }
+                for r in s.scalars(stmt)
+            ]
+
+    def per_seed_progress(self, job_id: str) -> dict[str, Any]:
+        """Aggregate task counts by seed (discovery partition).
+
+        Tasks have partition_key like 'rss:https://hnrss.org/...' for discovery
+        partitions and 'tail:https://www.bbc.com/article/...' for sub-fetches.
+        We group sub-fetches by the *discovery_channel* portion of the
+        payload — we don't have it directly, so we fall back to grouping
+        sub-tasks by source_type. The discovery rows still come through with
+        their own URL.
+        """
+        with self.session() as s:
+            # Discovery partitions (one per seed feed) — group by partition_key.
+            discovery = s.execute(
+                select(TaskRow.partition_key, TaskRow.status)
+                .where(
+                    TaskRow.job_id == job_id,
+                    TaskRow.source_type.in_(["rss", "atom", "sitemap", "gdelt"]),
+                )
+            ).all()
+            by_seed: dict[str, dict[str, Any]] = {}
+            for partition_key, status in discovery:
+                seed = by_seed.setdefault(
+                    partition_key,
+                    {"partition_key": partition_key, "status": status, "kind": "feed"},
+                )
+                seed["status"] = status
+            # Sub-fetch counts overall.
+            tail_counts = s.execute(
+                select(TaskRow.status, func.count())
+                .where(TaskRow.job_id == job_id, TaskRow.source_type == "tail_recrawl")
+                .group_by(TaskRow.status)
+            ).all()
+            tail_breakdown = {st: int(n) for st, n in tail_counts}
+            return {
+                "feeds": list(by_seed.values()),
+                "fetch": tail_breakdown,
+            }
+
+    def list_recent_manifests(self, limit: int = 8) -> list[dict[str, Any]]:
+        """Most recently committed JSONL chunks."""
+        with self.session() as s:
+            stmt = (
+                select(ManifestRow)
+                .order_by(ManifestRow.id.desc())
+                .limit(limit)
+            )
+            return [
+                {
+                    "id": r.id,
+                    "path": r.path,
+                    "records": r.records,
+                    "bytes": r.bytes,
+                    "committed_at": r.committed_at.isoformat() if r.committed_at else None,
+                }
+                for r in s.scalars(stmt)
+            ]
+
     @staticmethod
     def _task_state_from_row(row: TaskRow) -> TaskState:
         from awareness.schemas.doc import SourceKind

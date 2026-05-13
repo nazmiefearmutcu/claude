@@ -188,6 +188,37 @@ def create_app() -> FastAPI:
             raise HTTPException(500, "not initialized")
         return _State.state.get_tail()
 
+    @app.get("/tail/status")
+    def tail_status() -> dict[str, Any]:
+        """Rich tail status for the UI: counters + running tasks + recent
+        chunks + per-seed progress. Returns empty fields when no tail job
+        has ever been started."""
+        if _State.state is None or _State.planner is None:
+            raise HTTPException(500, "not initialized")
+        state = _State.state
+        tail_info = state.get_tail()
+        job_id = tail_info.get("job_id")
+        if not job_id:
+            return {
+                "tail": tail_info,
+                "job": None,
+                "task_status_counts": {},
+                "running_tasks": [],
+                "recent_completed": [],
+                "per_seed": {"feeds": [], "fetch": {}},
+                "recent_chunks": [],
+            }
+        job = state.get_job(job_id)
+        return {
+            "tail": tail_info,
+            "job": job.model_dump(mode="json") if job else None,
+            "task_status_counts": state.task_status_counts(job_id),
+            "running_tasks": state.list_running_tasks(job_id, limit=12),
+            "recent_completed": state.list_recent_completed_tasks(job_id, limit=10),
+            "per_seed": state.per_seed_progress(job_id),
+            "recent_chunks": state.list_recent_manifests(limit=8),
+        }
+
     @app.get("/inspect")
     def inspect(
         start: datetime = Query(...),
