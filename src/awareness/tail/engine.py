@@ -57,6 +57,19 @@ class TailEngine:
         self._task: asyncio.Task | None = None
         self._reseed_task: asyncio.Task | None = None
         self._job_id: str | None = None
+        # Visibility hooks for the UI: next poll time, last poll time/count.
+        self._next_reseed_at: float | None = None
+        self._last_reseed_at: str | None = None
+        self._last_reseed_count: int = 0
+
+    def info(self) -> dict[str, object]:
+        """Snapshot of in-process reseed bookkeeping for the API."""
+        return {
+            "next_reseed_at": self._next_reseed_at,
+            "last_reseed_at": self._last_reseed_at,
+            "last_reseed_count": self._last_reseed_count,
+            "in_process_running": self._task is not None and not self._task.done(),
+        }
 
     @property
     def running(self) -> bool:
@@ -71,54 +84,67 @@ class TailEngine:
         self._stop_event.clear()
 
         async def reseed_loop() -> None:
+            """Re-arm seed discovery tasks every tail_poll_seconds.
+
+            We are pedantic about exception handling: ANY error in the loop
+            body is logged, swallowed, and the loop keeps running. Earlier
+            this loop would crash silently on the first reseed (UNIQUE
+            constraint on (job_id, partition_key)) and the user would
+            wonder why nothing new ever happened.
+            """
+            iteration = 0
             try:
                 while not self._stop_event.is_set():
+                    self._next_reseed_at = utcnow().timestamp() + settings.tail_poll_seconds
                     await asyncio.sleep(settings.tail_poll_seconds)
                     if self._stop_event.is_set():
                         break
-                    # Re-emit seed discovery partitions so they're re-fetched
-                    # by the worker; the feeds adapter's checkpoint avoids
-                    # re-yielding URLs we've already seen.
-                    tasks: list[TaskState] = []
-                    for entry in seeds.get("feeds", []):
-                        if not entry.get("url"):
-                            continue
-                        tasks.append(
-                            TaskState(
-                                task_id=f"t-{uuid.uuid4().hex[:16]}",
-                                job_id=job_id,
-                                source_type=SourceKind.RSS,
-                                partition_key=f"rss:{entry['url']}",
-                                payload={"kind": "rss", "url": entry["url"]},
+                    iteration += 1
+                    try:
+                        tasks: list[TaskState] = []
+                        for entry in seeds.get("feeds", []):
+                            if not entry.get("url"):
+                                continue
+                            tasks.append(
+                                TaskState(
+                                    task_id=f"t-{uuid.uuid4().hex[:16]}",
+                                    job_id=job_id,
+                                    source_type=SourceKind.RSS,
+                                    partition_key=f"rss:{entry['url']}",
+                                    payload={"kind": "rss", "url": entry["url"]},
+                                )
                             )
-                        )
-                    for entry in seeds.get("atom", []):
-                        if not entry.get("url"):
-                            continue
-                        tasks.append(
-                            TaskState(
-                                task_id=f"t-{uuid.uuid4().hex[:16]}",
-                                job_id=job_id,
-                                source_type=SourceKind.RSS,
-                                partition_key=f"atom:{entry['url']}",
-                                payload={"kind": "atom", "url": entry["url"]},
+                        for entry in seeds.get("atom", []):
+                            if not entry.get("url"):
+                                continue
+                            tasks.append(
+                                TaskState(
+                                    task_id=f"t-{uuid.uuid4().hex[:16]}",
+                                    job_id=job_id,
+                                    source_type=SourceKind.RSS,
+                                    partition_key=f"atom:{entry['url']}",
+                                    payload={"kind": "atom", "url": entry["url"]},
+                                )
                             )
-                        )
-                    for entry in seeds.get("sitemaps", []):
-                        if not entry.get("url"):
-                            continue
-                        tasks.append(
-                            TaskState(
-                                task_id=f"t-{uuid.uuid4().hex[:16]}",
-                                job_id=job_id,
-                                source_type=SourceKind.RSS,
-                                partition_key=f"sitemap:{entry['url']}",
-                                payload={"kind": "sitemap", "url": entry["url"]},
+                        for entry in seeds.get("sitemaps", []):
+                            if not entry.get("url"):
+                                continue
+                            tasks.append(
+                                TaskState(
+                                    task_id=f"t-{uuid.uuid4().hex[:16]}",
+                                    job_id=job_id,
+                                    source_type=SourceKind.RSS,
+                                    partition_key=f"sitemap:{entry['url']}",
+                                    payload={"kind": "sitemap", "url": entry["url"]},
+                                )
                             )
-                        )
-                    if tasks:
-                        self._state.add_tasks(tasks)
-                        logger.info("tail_reseeded", count=len(tasks))
+                        if tasks:
+                            self._state.add_tasks(tasks)
+                            logger.info("tail_reseeded", count=len(tasks), iteration=iteration)
+                            self._last_reseed_at = utcnow().isoformat()
+                            self._last_reseed_count = len(tasks)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("tail_reseed_iteration_failed", iteration=iteration, err=str(exc))
             except asyncio.CancelledError:
                 pass
 

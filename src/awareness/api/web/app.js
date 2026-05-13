@@ -584,10 +584,25 @@ async function loadTailView() {
   // Now fetching
   const nowList = $("#tail-now-list");
   const running = data.running_tasks || [];
+  const engine = data.engine || {};
+  const pollSec = data.tail_poll_seconds || 60;
   clear(nowList);
-  $("#tail-now-meta").textContent = running.length ? `${running.length} in flight` : "idle";
+  // Compute "next poll" countdown.
+  let nextPollIn = null;
+  if (t.running && engine.next_reseed_at) {
+    const remaining = Math.max(0, Math.round(engine.next_reseed_at - Date.now() / 1000));
+    nextPollIn = remaining;
+  }
+  $("#tail-now-meta").textContent = running.length
+    ? `${running.length} in flight`
+    : (t.running ? (nextPollIn !== null ? `next poll in ${nextPollIn}s` : `idle · poll every ${pollSec}s`) : "tail stopped");
   if (running.length === 0) {
-    nowList.appendChild(el("li", { class: "muted-li" }, t.running ? "Idle. Next poll in ≤ tail_poll_seconds." : "Tail is stopped."));
+    const idleMsg = t.running
+      ? (engine.last_reseed_at
+          ? `Idle. Last poll ${ago(engine.last_reseed_at, false)} found ${engine.last_reseed_count || 0} feed${engine.last_reseed_count === 1 ? "" : "s"} to re-arm. Next poll in ~${nextPollIn ?? pollSec}s.`
+          : `Idle. First poll in ~${nextPollIn ?? pollSec}s.`)
+      : "Tail is stopped.";
+    nowList.appendChild(el("li", { class: "muted-li" }, idleMsg));
   } else {
     for (const r of running) {
       const li = el("li", { class: "tn-row" });

@@ -277,12 +277,45 @@ class StateDB:
 
     # ── tasks ────────────────────────────────────────────────────────────
     def add_tasks(self, tasks: Iterable[TaskState]) -> int:
+        """Add or RE-ARM tasks.
+
+        Tasks have a UNIQUE(job_id, partition_key) constraint to keep the
+        planner idempotent. When a caller (notably the tail reseed loop)
+        asks to add a task whose (job_id, partition_key) already exists,
+        we silently RESET that existing row to PENDING so the worker pool
+        picks it back up — instead of crashing on an IntegrityError. This
+        makes reseed safe: re-polling the same RSS seed is just "re-arm
+        the discovery task". Returns the number of NEW rows inserted.
+        """
         materialized = list(tasks)
         if not materialized:
             return 0
         added = 0
+        rearmed = 0
+        # Count re-arms by *previous status* so we can keep the job's status
+        # counters consistent (the worker will re-emit completion increments).
+        rearmed_from: dict[str, int] = {}
         with self.session() as s:
             for t in materialized:
+                # Look up by (job_id, partition_key) — the unique key.
+                existing = s.execute(
+                    select(TaskRow).where(
+                        TaskRow.job_id == t.job_id,
+                        TaskRow.partition_key == t.partition_key,
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    # Re-arm: reset status, remember the previous one.
+                    prev = existing.status
+                    rearmed_from[prev] = rearmed_from.get(prev, 0) + 1
+                    existing.status = TaskStatus.PENDING.value
+                    existing.started_at = None
+                    existing.completed_at = None
+                    existing.last_error = None
+                    # Keep attempts so we still respect max_retries semantics
+                    # across reseeds.
+                    rearmed += 1
+                    continue
                 row = TaskRow(
                     task_id=t.task_id,
                     job_id=t.job_id,
@@ -300,14 +333,37 @@ class StateDB:
                     bytes_processed=t.bytes_processed,
                     checkpoint_json=json.dumps(t.checkpoint or {}),
                 )
-                s.merge(row)
+                s.add(row)
                 added += 1
-            s.execute(
-                update(JobRow)
-                .where(JobRow.job_id == materialized[0].job_id)
-                .values(tasks_total=JobRow.tasks_total + added)
-            )
+            if added:
+                s.execute(
+                    update(JobRow)
+                    .where(JobRow.job_id == materialized[0].job_id)
+                    .values(tasks_total=JobRow.tasks_total + added)
+                )
+            # Roll back job counters for re-armed tasks so the worker's later
+            # completion bumps don't push tasks_completed past tasks_total.
+            completed_back = rearmed_from.get(TaskStatus.COMPLETED.value, 0)
+            failed_back = rearmed_from.get(TaskStatus.FAILED.value, 0)
+            dead_back = rearmed_from.get(TaskStatus.DEAD_LETTERED.value, 0)
+            if completed_back or failed_back or dead_back:
+                s.execute(
+                    update(JobRow)
+                    .where(JobRow.job_id == materialized[0].job_id)
+                    .values(
+                        tasks_completed=JobRow.tasks_completed - completed_back,
+                        tasks_failed=JobRow.tasks_failed - failed_back,
+                        tasks_dead_lettered=JobRow.tasks_dead_lettered - dead_back,
+                    )
+                )
             s.commit()
+        if rearmed:
+            logger.info(
+                "tasks_rearmed",
+                count=rearmed,
+                from_=rearmed_from,
+                job_id=materialized[0].job_id,
+            )
         return added
 
     def claim_pending_tasks(self, job_id: str, limit: int) -> list[TaskState]:

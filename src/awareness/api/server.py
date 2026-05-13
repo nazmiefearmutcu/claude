@@ -79,6 +79,16 @@ def create_app() -> FastAPI:
     async def lifespan(_app: FastAPI):
         state = StateDB(settings.state_db_url or "sqlite:///awareness.sqlite")
         state.init()
+        # Reconcile phantom "running" tail state from a previous process that
+        # didn't clean up. Whatever was running in another Python process is
+        # not running here. Mark it cancelled so the UI doesn't lie.
+        tail = state.get_tail()
+        if tail.get("running"):
+            stale_job = tail.get("job_id")
+            state.set_tail(running=False, job_id=stale_job, note="reconciled-on-startup")
+            if stale_job:
+                from awareness.schemas.jobs import JobStatus  # local import
+                state.set_job_status(stale_job, JobStatus.CANCELLED, note="orphaned-by-process-exit")
         _State.state = state
         _State.planner = Planner(state)
         _State.tail = TailEngine(state, _State.planner)
@@ -191,16 +201,23 @@ def create_app() -> FastAPI:
     @app.get("/tail/status")
     def tail_status() -> dict[str, Any]:
         """Rich tail status for the UI: counters + running tasks + recent
-        chunks + per-seed progress. Returns empty fields when no tail job
-        has ever been started."""
+        chunks + per-seed progress + reseed cadence. Returns empty fields
+        when no tail job has ever been started."""
         if _State.state is None or _State.planner is None:
             raise HTTPException(500, "not initialized")
         state = _State.state
         tail_info = state.get_tail()
+        engine_info = _State.tail.info() if _State.tail else {}
         job_id = tail_info.get("job_id")
+        settings = get_settings()
+        base = {
+            "tail": tail_info,
+            "engine": engine_info,
+            "tail_poll_seconds": settings.tail_poll_seconds,
+        }
         if not job_id:
             return {
-                "tail": tail_info,
+                **base,
                 "job": None,
                 "task_status_counts": {},
                 "running_tasks": [],
@@ -210,7 +227,7 @@ def create_app() -> FastAPI:
             }
         job = state.get_job(job_id)
         return {
-            "tail": tail_info,
+            **base,
             "job": job.model_dump(mode="json") if job else None,
             "task_status_counts": state.task_status_counts(job_id),
             "running_tasks": state.list_running_tasks(job_id, limit=12),

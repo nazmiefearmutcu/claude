@@ -132,10 +132,23 @@ awareness-api                   # listens on 127.0.0.1:8085
 # Endpoints: /healthz /status /metrics /backfill /tail /inspect /counts ...
 ```
 
+## What this is and isn't
+
+| Yes | No (despite earlier docs / commit messages) |
+| --- | --- |
+| Local-only ingestion: SQLite state, JSONL on disk, Iceberg on disk via PyIceberg | **There is no cloud storage**. Nothing leaves your machine. The `ops/compose` Postgres + MinIO + Redpanda + ClickHouse stack is opt-in scaffolding; it's not running by default and the code does not write to it. |
+| Polling-based live updates: dashboard refreshes every 4–5s; tail view every 2s | **No Server-Sent Events / WebSocket push.** The "live activity feed" pulses when new captures land, but it polls; if the tail is idle (nothing new to discover) the UI shows the same numbers. |
+| `tail_poll_seconds` cadence re-polls every configured RSS/Atom/Sitemap seed and re-arms the discovery task | Until commit `<bug-fix>` the reseed loop crashed silently on a UNIQUE constraint after the first iteration. If you were running an older build, your "tail" effectively ran *once* and then sat idle. |
+| Robots.txt + per-domain politeness are enforced in `tail_recrawl` | We don't yet expose per-fetch robots outcomes in the UI. |
+| `max_tasks` caps the *planner's* initial output | Sub-partitions enqueued by discovery adapters (CC index → WARC repair, GDELT slot → tail recrawl) are **not** capped by `max_tasks`. A single GDELT 15-minute slot can fan out into 1000+ sub-fetches. |
+
 ## Configuration
 
-`configs/awareness.yaml` is the default config file; any field can be
-overridden by env var `AW_<FIELD>` (case-insensitive). Examples:
+`configs/awareness.yaml` is the default config file; values set in YAML take
+precedence over env vars (a quirk we'll fix). To set an env var, also remove
+the corresponding line from `configs/awareness.yaml`.
+
+Examples:
 
 | Env | Meaning |
 | --- | --- |
