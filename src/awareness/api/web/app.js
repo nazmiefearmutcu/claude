@@ -213,31 +213,47 @@ let capsSearchTimer = null;
 
 async function loadCaptures(reset = false) {
   if (reset) caps.offset = 0;
-  const params = new URLSearchParams();
-  params.set("limit", caps.limit);
-  params.set("offset", caps.offset);
   const q = $("#caps-search").value.trim();
   const source = $("#caps-source").value;
   const domain = $("#caps-domain").value.trim();
   const start = $("#caps-start").value;
   const end = $("#caps-end").value;
-  if (q) params.set("search", q);
-  if (source) params.set("source", source);
-  if (domain) params.set("domain", domain);
-  if (start) params.set("start", start);
-  if (end) params.set("end", end);
 
   const list = $("#caps-list");
   const meta = $("#caps-meta");
   meta.textContent = "loading…";
 
+  // Search-mode hits /search (BM25 ranked, with snippets); browse-mode hits
+  // /captures (chronological).
+  const params = new URLSearchParams();
+  params.set("limit", caps.limit);
+  params.set("offset", caps.offset);
+  if (source) params.set("source", source);
+  if (domain) params.set("domain", domain);
+  if (start) params.set("start", start);
+  if (end) params.set("end", end);
+
+  const isSearch = !!q;
+  let url;
+  if (isSearch) {
+    params.set("q", q);
+    url = "/search?" + params.toString();
+  } else {
+    url = "/captures?" + params.toString();
+  }
+
   try {
-    const data = await api("/captures?" + params.toString());
+    const data = await api(url);
     caps.total = data.total;
-    renderCaps(list, data.rows);
+    renderCaps(list, data.rows || [], { search: q, ranked: !!data.ranked });
     const from = data.total ? caps.offset + 1 : 0;
-    const to = Math.min(caps.offset + data.rows.length, data.total);
-    meta.textContent = `${from}–${to} of ${fmt(data.total)} captures`;
+    const to = Math.min(caps.offset + (data.rows || []).length, data.total);
+    if (isSearch) {
+      const mode = data.ranked ? "BM25-ranked" : "fallback substring";
+      meta.textContent = `${from}–${to} of ${fmt(data.total)} matches · ${mode}`;
+    } else {
+      meta.textContent = `${from}–${to} of ${fmt(data.total)} captures · chronological`;
+    }
     $("#caps-pos").textContent = data.total ? `${from}–${to} of ${fmt(data.total)}` : "—";
     $("#caps-prev").disabled = caps.offset <= 0;
     $("#caps-next").disabled = caps.offset + caps.limit >= data.total;
@@ -247,11 +263,34 @@ async function loadCaptures(reset = false) {
   }
 }
 
-function renderCaps(root, rows) {
+// Build DOM fragment with <mark> tags around every match of any term, case
+// insensitive, word-boundary. Uses matchAll (no innerHTML on values).
+function highlightedFragment(text, terms) {
+  const frag = document.createDocumentFragment();
+  if (!text) return frag;
+  if (!terms || terms.length === 0) {
+    frag.appendChild(document.createTextNode(text));
+    return frag;
+  }
+  const pattern = new RegExp(
+    "\\b(" + terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")\\b",
+    "ig"
+  );
+  let lastIndex = 0;
+  for (const m of text.matchAll(pattern)) {
+    if (m.index > lastIndex) frag.appendChild(document.createTextNode(text.slice(lastIndex, m.index)));
+    frag.appendChild(el("mark", { class: "hl" }, m[0]));
+    lastIndex = m.index + m[0].length;
+  }
+  if (lastIndex < text.length) frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+  return frag;
+}
+
+function renderCaps(root, rows, { search = "", ranked = false } = {}) {
   clear(root);
   for (const r of rows) {
     const li = el("li", {
-      class: "cap-row",
+      class: "cap-row" + (search ? " has-snippet" : ""),
       tabindex: "0",
       role: "button",
       "aria-label": `${r.title || "untitled"} — ${r.source_type}`,
@@ -259,13 +298,34 @@ function renderCaps(root, rows) {
       onkeydown: (ev) => { if (ev.key === "Enter") openReader(r.capture_id); },
       onclick: () => openReader(r.capture_id),
     });
-    li.appendChild(el("div", { class: "cap-time", title: String(r.fetch_ts || "") }, ago(r.fetch_ts, true)));
 
+    // Left column: score chip in ranked search mode, otherwise time.
+    if (search && ranked && typeof r.score === "number") {
+      li.appendChild(el("div", { class: "cap-score", title: "BM25 score" }, r.score.toFixed(2)));
+    } else {
+      li.appendChild(el("div", { class: "cap-time", title: String(r.fetch_ts || "") }, ago(r.fetch_ts, true)));
+    }
+
+    // Main: title + (snippet) + meta.
     const main = el("div", { class: "cap-main" });
-    main.appendChild(el("h3", { class: "cap-title", text: r.title || "(untitled)" }));
+    const titleNode = el("h3", { class: "cap-title" });
+    if (search && r.terms && r.terms.length) {
+      titleNode.appendChild(highlightedFragment(r.title || "(untitled)", r.terms));
+    } else {
+      titleNode.textContent = r.title || "(untitled)";
+    }
+    main.appendChild(titleNode);
+
+    if (search && r.snippet) {
+      const snip = el("p", { class: "cap-snippet" });
+      snip.appendChild(highlightedFragment(r.snippet, r.terms || []));
+      main.appendChild(snip);
+    }
+
     const m = el("div", { class: "cap-meta" });
     m.appendChild(el("span", { class: "domain", text: r.domain || "—" }));
     if (r.url) m.appendChild(el("span", { class: "url", text: r.url }));
+    if (search) m.appendChild(el("span", { class: "when", text: ago(r.fetch_ts, true) + " ago" }));
     main.appendChild(m);
     li.appendChild(main);
 
@@ -342,7 +402,53 @@ async function openReader(cid) {
   meta.appendChild(dl);
   body.appendChild(meta);
 
+  // Related captures (sibling dup_group entries).
+  const relatedSection = el("section", { class: "reader-related" });
+  relatedSection.appendChild(el("div", { class: "reader-meta-title", text: "related captures" }));
+  const relatedBody = el("div", { class: "related-body" });
+  relatedBody.appendChild(el("p", { class: "muted", text: "loading…" }));
+  relatedSection.appendChild(relatedBody);
+  body.appendChild(relatedSection);
+
+  void loadRelated(cid, relatedBody);
+
   setTimeout(() => $("#reader-close").focus(), 80);
+}
+
+async function loadRelated(cid, host) {
+  try {
+    const r = await api("/captures/" + encodeURIComponent(cid) + "/related?limit=12");
+    clear(host);
+    const sibs = r.siblings || [];
+    if (sibs.length === 0) {
+      host.appendChild(el("p", { class: "muted", text: "No related captures — this is the only member of its dup-group." }));
+      return;
+    }
+    const list = el("ul", { class: "related-list" });
+    for (const s of sibs) {
+      const li = el("li", { class: "related-item" });
+      const btn = el("button", {
+        class: "related-link",
+        onclick: () => openReader(s.capture_id),
+        "aria-label": "Open " + (s.title || "related capture"),
+      });
+      btn.appendChild(el("span", { class: "related-when", text: ago(s.fetch_ts, true) + " ago" }));
+      btn.appendChild(el("span", { class: "related-title", text: s.title || "(untitled)" }));
+      const meta = el("span", { class: "related-meta" });
+      meta.appendChild(el("span", { class: "src", text: s.source_type }));
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(el("span", { class: "dom", text: s.domain || "—" }));
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(document.createTextNode(fmt(s.text_len) + " ch"));
+      btn.appendChild(meta);
+      li.appendChild(btn);
+      list.appendChild(li);
+    }
+    host.appendChild(list);
+  } catch (err) {
+    clear(host);
+    host.appendChild(el("p", { class: "muted", text: "failed: " + err.message }));
+  }
 }
 function closeReader() {
   const reader = $("#reader");

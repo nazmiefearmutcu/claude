@@ -15,6 +15,8 @@ Endpoints:
     GET  /inspect                — date/domain/source range query
     GET  /captures               — paginated capture listing for UI
     GET  /captures/{capture_id}  — full capture (incl. text) for UI detail view
+    GET  /captures/{id}/related  — sibling captures in the same dup_group
+    GET  /search                 — BM25-ranked full-text search w/ snippets
     GET  /counts                 — counts grouped by source & domain
     GET  /dedup-stats            — dedup index stats
 
@@ -313,6 +315,46 @@ def create_app() -> FastAPI:
         if not rows:
             raise HTTPException(404, "capture not found")
         return rows[0]
+
+    @app.get("/captures/{capture_id}/related")
+    def capture_related(capture_id: str, limit: int = Query(12, ge=1, le=50)) -> dict[str, Any]:
+        from awareness.storage.duckdb_index import find_related_captures  # local import
+
+        s = get_settings()
+        idx = DuckDbIndex(
+            db_path=s.duckdb_path(),
+            jsonl_dir=s.staging_jsonl_dir(),
+            iceberg_warehouse=s.iceberg_warehouse,
+        )
+        conn = idx.connect()
+        siblings = find_related_captures(conn, capture_id, limit=limit)
+        return {"capture_id": capture_id, "siblings": siblings}
+
+    @app.get("/search")
+    def search(
+        q: str = Query(..., min_length=1),
+        limit: int = Query(30, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+        source: Optional[str] = Query(None),
+        domain: Optional[str] = Query(None),
+        start: Optional[datetime] = Query(None),
+        end: Optional[datetime] = Query(None),
+    ) -> dict[str, Any]:
+        s = get_settings()
+        idx = DuckDbIndex(
+            db_path=s.duckdb_path(),
+            jsonl_dir=s.staging_jsonl_dir(),
+            iceberg_warehouse=s.iceberg_warehouse,
+        )
+        return idx.search(
+            q,
+            limit=limit,
+            offset=offset,
+            source=source,
+            domain=domain,
+            start=to_utc(start) if start else None,
+            end=to_utc(end) if end else None,
+        )
 
     # ── static dashboard ─────────────────────────────────────────────────
     web_dir = Path(__file__).resolve().parent / "web"
